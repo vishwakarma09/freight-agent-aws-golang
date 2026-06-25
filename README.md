@@ -2,6 +2,8 @@
 
 A replica of the Python `freight-agent-aws` application, rebuilt in **Golang** for high-performance execution on **AWS Lambda** (custom `provided.al2023` ARM64 runtime). The project connects to a PostgreSQL database (supporting `pgvector` for embedding searches), uses Amazon S3 for private document storage, and hosts a React/Vite web application on S3.
 
+**Demo URL**: [http://freight-agent-frontend-go-dev-865122443732.s3-website.us-east-2.amazonaws.com/](http://freight-agent-frontend-go-dev-865122443732.s3-website.us-east-2.amazonaws.com/)
+
 ---
 
 ## AWS Architecture
