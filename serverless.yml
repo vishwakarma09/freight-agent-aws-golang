@@ -1,0 +1,96 @@
+service: freight-agent-api-go
+useDotenv: true
+
+provider:
+  name: aws
+  runtime: provided.al2023
+  architecture: arm64
+  stage: ${opt:stage, 'dev'}
+  region: ${opt:region, 'us-east-2'}
+  versionFunctions: false
+  environment:
+    ENV: ${self:provider.stage}
+    S3_BUCKET_NAME: ${env:S3_BUCKET_NAME, 'dispatch-private-go'}
+    DATABASE_URL: ${env:DATABASE_URL, 'postgresql://user:password@localhost:5432/freight_bidding_db'}
+    FRONTEND_URL: ${env:FRONTEND_URL, 'http://localhost:5173'}
+    CEREBRAS_API_KEY: ${env:CEREBRAS_API_KEY, ''}
+    SMTP_HOST: ${env:SMTP_HOST, 'localhost'}
+    SMTP_PORT: ${env:SMTP_PORT, '1025'}
+    SMTP_USER: ${env:SMTP_USER, ''}
+    SMTP_PASSWORD: ${env:SMTP_PASSWORD, ''}
+    SMTP_TLS: ${env:SMTP_TLS, 'False'}
+    EMAILS_FROM_EMAIL: ${env:EMAILS_FROM_EMAIL, ''}
+    GOOGLE_CLIENT_ID: ${env:GOOGLE_CLIENT_ID, 'xxxxxxxxxxxxxxxxxxxxxxxxx'}
+    GOOGLE_CLIENT_SECRET: ${env:GOOGLE_CLIENT_SECRET, ''}
+
+  # Grant Lambda permissions to access the S3 bucket
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - s3:GetObject
+            - s3:PutObject
+            - s3:DeleteObject
+            - s3:ListBucket
+          Resource:
+            - arn:aws:s3:::${self:provider.environment.S3_BUCKET_NAME}
+            - arn:aws:s3:::${self:provider.environment.S3_BUCKET_NAME}/*
+
+package:
+  individually: true
+
+functions:
+  api:
+    handler: bootstrap
+    package:
+      artifact: bin/api/api.zip
+    events:
+      - httpApi:
+          path: /
+          method: ANY
+      - httpApi:
+          path: /{proxy+}
+          method: ANY
+  cron:
+    handler: bootstrap
+    package:
+      artifact: bin/cron/cron.zip
+    events:
+      - schedule: rate(10 minutes)
+
+resources:
+  Resources:
+    FrontendBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: freight-agent-frontend-go-${self:provider.stage}-${aws:accountId}
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: false
+          BlockPublicPolicy: false
+          IgnorePublicAcls: false
+          RestrictPublicBuckets: false
+        WebsiteConfiguration:
+          IndexDocument: index.html
+          ErrorDocument: index.html
+    FrontendBucketPolicy:
+      Type: AWS::S3::BucketPolicy
+      Properties:
+        Bucket: !Ref FrontendBucket
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Sid: PublicReadGetObject
+              Effect: Allow
+              Principal: "*"
+              Action:
+                - s3:GetObject
+              Resource: !Join
+                - ""
+                - - "arn:aws:s3:::"
+                  - !Ref FrontendBucket
+                  - "/*"
+  Outputs:
+    FrontendWebsiteUrl:
+      Value: !GetAtt FrontendBucket.WebsiteURL
+      Description: URL of the frontend website hosted on S3
