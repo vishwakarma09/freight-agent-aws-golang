@@ -7,7 +7,7 @@ import (
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
-	"github.com/awslabs/aws-lambda-go-api-proxy/gin"
+	ginadapter "github.com/awslabs/aws-lambda-go-api-proxy/gin"
 	"github.com/vishwakarma09/freight-agent-aws-golang/internal/config"
 	"github.com/vishwakarma09/freight-agent-aws-golang/internal/db"
 	"github.com/vishwakarma09/freight-agent-aws-golang/internal/routes"
@@ -16,25 +16,23 @@ import (
 var ginLambda *ginadapter.GinLambdaV2
 
 func init() {
-	log.Println("Initializing Application...")
-	
-	// Load configuration
+	log.Println("Initializing Dispatch Freight API...")
+
 	if err := config.LoadConfig(); err != nil {
 		log.Fatalf("Failed to load configuration: %v\n", err)
 	}
 
-	// Initialize database
 	if err := db.InitDB(); err != nil {
 		log.Fatalf("Failed to initialize database: %v\n", err)
 	}
 
-	// Perform migrations and seeds
-	db.MigrateAndSeed()
+	// Only run DDL migrations when RUN_MIGRATIONS=true (avoids cold-start DDL contention in Lambda)
+	if config.Settings.RunMigrations {
+		db.MigrateAndSeed()
+	}
 
-	// Initialize Gin router
 	r := routes.SetupRouter()
 
-	// Check if running in Lambda
 	if os.Getenv("AWS_LAMBDA_FUNCTION_NAME") != "" {
 		ginLambda = ginadapter.NewV2(r)
 	}

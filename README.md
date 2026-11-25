@@ -2,7 +2,7 @@
 
 A replica of the Python `freight-agent-aws` application, rebuilt in **Golang** for high-performance execution on **AWS Lambda** (custom `provided.al2023` ARM64 runtime). The project connects to a PostgreSQL database (supporting `pgvector` for embedding searches), uses Amazon S3 for private document storage, and hosts a React/Vite web application on S3.
 
-**Demo URL**: [http://freight-agent-frontend-go-dev-865122443732.s3-website.us-east-2.amazonaws.com/](http://freight-agent-frontend-go-dev-865122443732.s3-website.us-east-2.amazonaws.com/)
+**Live URL**: [https://freight.owera.ca](https://freight.owera.ca)
 
 ---
 
@@ -120,26 +120,16 @@ Follow these steps to configure and run the application locally on your machine:
   CREATE EXTENSION IF NOT EXISTS vector;
   ```
 
-### 1. Configuration (`.env`)
-Create a `.env` file in the root directory (based on the template below) and fill in the credentials:
-```ini
-ACCESS_KEY=your-aws-access-key-id
-SECRET_ACCESS_KEY=your-aws-secret-access-key
-API_URL=http://localhost:8000
-FRONTEND_URL=http://localhost:5173
-DATABASE_URL=postgresql://user:password@localhost:5432/dbname
-CEREBRAS_API_KEY=your-cerebras-key
-GOOGLE_CLIENT_ID=your-google-client-id
-GOOGLE_CLIENT_SECRET=your-google-client-secret
-
-# SMTP/IMAP Email Server
-SMTP_HOST=your-smtp-host
-SMTP_PORT=587
-SMTP_USER=your-smtp-username
-SMTP_PASSWORD=your-smtp-password
-EMAILS_FROM_EMAIL=your-smtp-username
-SMTP_TLS=True
-```
+### 1. Configuration & Secrets Management
+- **Local Development**: Copy `.env.example` to `.env` (gitignored) and `frontend/.env.example` to `frontend/.env` (gitignored).
+- **Local Production Builds**: Store production variables in gitignored `.env.production` (backend) and `frontend/.env.production` (frontend).
+- **AWS Lambda Production (AWS Secrets Manager)**: Never store secrets in `serverless.yml` or Lambda plaintext environment variables. Sync your gitignored `.env.production` to AWS Secrets Manager (`freight-agent/prod/secrets`):
+  ```bash
+  ./scripts/push_secrets_to_aws.sh prod us-east-2
+  ```
+  Both Lambda functions (`api` and `cron`) automatically load runtime secrets from AWS Secrets Manager at cold start via `AWS_SECRET_NAME`.
+- **Encryption**: Tenant SMTP/IMAP credentials are encrypted at rest with **AES-256-GCM** (or **AWS KMS Envelope Encryption** when `KMS_KEY_ID` is set) and are never returned in API responses.
+- **Monetization (Stripe Option A)** & **Enterprise Organizations**: Configure `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, and `STRIPE_PRICE_*` keys in AWS Secrets Manager. Multi-seat Organizations and RBAC team invitations are unlocked on the Enterprise / 3PL tier.
 
 ### 2. Start the Backend API Server
 Start the Gin HTTP server locally (listens on `:8000` by default):

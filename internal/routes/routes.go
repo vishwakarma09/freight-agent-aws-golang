@@ -4,26 +4,32 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/vishwakarma09/freight-agent-aws-golang/internal/config"
 )
 
 func SetupRouter() *gin.Engine {
-	r := gin.Default()
+	if config.Settings != nil && config.Settings.IsProd() {
+		gin.SetMode(gin.ReleaseMode)
+	}
 
-	// CORS Middleware
-	r.Use(CORSMiddleware())
+	r := gin.New()
+	r.Use(gin.Logger(), gin.Recovery(), CORSMiddleware())
 
-	// Root Route
+	// Health check root route
 	r.GET("/", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"status": "running",
-			"engine": "Freight bidding workflow engine v1.0.0 on Go AWS Lambda",
+			"engine": "Dispatch freight bidding workflow engine v2.0.0",
+			"env":    config.Settings.Env,
 		})
 	})
 
-	// API Group
 	api := r.Group("/api")
 	{
 		RegisterAuthRoutes(api)
+		RegisterOrganizationRoutes(api)
+		RegisterBillingRoutes(api)
 		RegisterQuoteRoutes(api)
 		RegisterCarrierRoutes(api)
 		RegisterCustomerRoutes(api)

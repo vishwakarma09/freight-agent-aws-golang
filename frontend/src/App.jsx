@@ -1,20 +1,30 @@
-import React from 'react'
+import React, { Suspense, lazy } from 'react'
 import { AppProvider, useApp } from './context/AppContext'
 import LandingPage from './pages/LandingPage'
 import PricingPage from './pages/PricingPage'
 import LoginPage from './pages/LoginPage'
 import RegisterPage from './pages/RegisterPage'
-import CarriersList from './pages/CarriersList'
-import CarrierDetails from './pages/CarrierDetails'
 import Dashboard from './pages/Dashboard'
-import Billing from './pages/Billing'
-import Analytics from './pages/Analytics'
-import Simulator from './pages/Simulator'
-import { LayoutDashboard, Receipt, BarChart3, Mail, Bell, RefreshCw, Network, LogOut, ExternalLink } from 'lucide-react'
+import {
+  LayoutDashboard, Receipt, BarChart3, Mail, Bell, RefreshCw,
+  Network, LogOut, ExternalLink, CreditCard, Building2
+} from 'lucide-react'
+
+const CarriersList = lazy(() => import('./pages/CarriersList'))
+const CarrierDetails = lazy(() => import('./pages/CarrierDetails'))
+const Billing = lazy(() => import('./pages/Billing'))
+const Analytics = lazy(() => import('./pages/Analytics'))
+const Simulator = lazy(() => import('./pages/Simulator'))
+const Subscription = lazy(() => import('./pages/Subscription'))
+const Organization = lazy(() => import('./pages/Organization'))
 
 const AppContent = () => {
-  const { selectedTab, setSelectedTab, notifications, loading, fetchData, isAuthenticated, logout, addNotification } = useApp()
+  const {
+    selectedTab, setSelectedTab, notifications, loading, fetchData,
+    isAuthenticated, logout, addNotification, backendEnv, billingSummary, user
+  } = useApp()
 
+  const isProd = backendEnv === 'prod' || backendEnv === 'production'
   const publicTabs = ['landing', 'pricing', 'login', 'register']
   const isPublicPage = publicTabs.includes(selectedTab)
 
@@ -23,27 +33,25 @@ const AppContent = () => {
     authRef.current = isAuthenticated
   }, [isAuthenticated])
 
-  // Handle URL email activation response parameters
+  // Handle activation / reset / invite URL query parameters
   React.useEffect(() => {
     const params = new URLSearchParams(window.location.search)
     const activated = params.get('activated')
     const activationError = params.get('activation_error')
+    const resetToken = params.get('reset_token')
+    const inviteToken = params.get('invite_token')
 
     if (activated === 'true') {
-      // Clear URL query parameters
-      const newUrl = window.location.pathname
-      window.history.replaceState({}, '', newUrl)
-      
-      // Notify and navigate
+      window.history.replaceState({}, '', window.location.pathname)
       addNotification("Your account has been successfully activated! Please sign in.", "success")
       setSelectedTab('login')
     } else if (activationError) {
-      // Clear URL query parameters
-      const newUrl = window.location.pathname
-      window.history.replaceState({}, '', newUrl)
-      
-      // Notify and navigate
-      addNotification("Invalid or expired activation token. Please try again.", "error")
+      window.history.replaceState({}, '', window.location.pathname)
+      addNotification("Invalid or expired activation token. Please try registering again.", "error")
+      setSelectedTab('register')
+    } else if (resetToken) {
+      setSelectedTab('login')
+    } else if (inviteToken) {
       setSelectedTab('register')
     }
   }, [addNotification, setSelectedTab])
@@ -59,13 +67,15 @@ const AppContent = () => {
       '/connectors': 'connectors_list',
       '/analytics': 'analytics',
       '/simulator': 'simulator',
-      '/billing': 'billing'
+      '/ledger': 'billing',
+      '/billing': 'billing',
+      '/subscription': 'subscription',
+      '/organization': 'organization'
     }
 
     const handlePopState = () => {
       const currentPath = window.location.pathname
       const tabFromPath = pathMap[currentPath] || 'landing'
-      
       const publicTabsList = ['landing', 'pricing', 'login', 'register']
       if (!authRef.current && !publicTabsList.includes(tabFromPath)) {
         setSelectedTab('landing')
@@ -75,12 +85,10 @@ const AppContent = () => {
       }
     }
 
-    // Initialize tab from direct URL entry
     handlePopState()
-
     window.addEventListener('popstate', handlePopState)
     return () => window.removeEventListener('popstate', handlePopState)
-  }, [])
+  }, [setSelectedTab])
 
   const isFirstRender = React.useRef(true)
 
@@ -100,7 +108,9 @@ const AppContent = () => {
       'connector_details': '/connectors',
       'analytics': '/analytics',
       'simulator': '/simulator',
-      'billing': '/billing'
+      'billing': '/ledger',
+      'subscription': '/subscription',
+      'organization': '/organization'
     }
 
     const targetPath = tabToPathMap[selectedTab] || '/'
@@ -122,12 +132,13 @@ const AppContent = () => {
     { id: 'dashboard', name: 'Freight Pipeline', icon: LayoutDashboard },
     { id: 'connectors_list', name: 'Carriers Hub', icon: Network },
     { id: 'analytics', name: 'Analytics Center', icon: BarChart3 },
-    { id: 'simulator', name: 'Email Simulator', icon: Mail },
-    { id: 'billing', name: 'Billing Ledger', icon: Receipt }
+    ...(!isProd ? [{ id: 'simulator', name: 'Email Simulator', icon: Mail }] : []),
+    { id: 'billing', name: 'Freight Ledger', icon: Receipt },
+    { id: 'organization', name: 'Organization', icon: Building2 },
+    { id: 'subscription', name: 'Subscription & Usage', icon: CreditCard }
   ]
 
   const renderActivePage = () => {
-    // Auth Guard: redirect unauthenticated users to landing
     if (!isAuthenticated && !isPublicPage) {
       return <LandingPage />
     }
@@ -148,21 +159,23 @@ const AppContent = () => {
       case 'analytics':
         return <Analytics />
       case 'simulator':
-        return <Simulator />
+        return isProd ? <Dashboard /> : <Simulator />
       case 'connectors_list':
         return <CarriersList />
       case 'connector_details':
         return <CarrierDetails />
+      case 'subscription':
+        return <Subscription />
+      case 'organization':
+        return <Organization />
       default:
         return <LandingPage />
     }
   }
 
-  // Render Public Layout (No Sidebar)
   if (isPublicPage || (!isAuthenticated && !isPublicPage)) {
     return (
       <div className="public-layout">
-        {/* Toast Notifications */}
         <div className="toast-container">
           {notifications.map(n => (
             <div key={n.id} className={`toast-card ${n.type}`}>
@@ -176,10 +189,8 @@ const AppContent = () => {
     )
   }
 
-  // Render Private Dashboard Layout (With Sidebar)
   return (
     <div className="app-container">
-      {/* Toast Notifications */}
       <div className="toast-container">
         {notifications.map(n => (
           <div key={n.id} className={`toast-card ${n.type}`}>
@@ -189,13 +200,12 @@ const AppContent = () => {
         ))}
       </div>
 
-      {/* Sidebar Navigation */}
       <aside className="app-sidebar">
         <div className="sidebar-brand">
           <div className="brand-logo">D</div>
           <div className="brand-details">
             <span className="brand-name">DISPATCH</span>
-            <span className="brand-sub">Mission Control</span>
+            <span className="brand-sub">{user?.organization?.name || 'Mission Control'}</span>
           </div>
         </div>
 
@@ -217,27 +227,27 @@ const AppContent = () => {
         </nav>
 
         <div className="sidebar-footer space-y-2 px-4 py-3 border-t border-white/5">
-          <button 
+          <button
             onClick={() => setSelectedTab('landing')}
             className="w-full flex items-center gap-2 py-2 px-3 text-xs text-on-surface-variant hover:text-primary transition-colors hover:bg-white/5 rounded-lg"
           >
             <ExternalLink size={14} />
             <span>Go to Landing</span>
           </button>
-          
-          <button 
+
+          <button
             onClick={logout}
             className="w-full flex items-center gap-2 py-2 px-3 text-xs text-on-surface-variant hover:text-error transition-colors hover:bg-white/5 rounded-lg"
           >
             <LogOut size={14} />
             <span>Logout</span>
           </button>
-          
-          <div className="h-4"></div>
-          
+
+          <div className="h-2"></div>
+
           <div className="status-indicator online">
             <div className="status-dot"></div>
-            <span>Dev API Online</span>
+            <span>{isProd ? 'API Connected' : 'Dev Sandbox'}</span>
           </div>
           <button className="sync-button w-full" onClick={() => fetchData(true)} disabled={loading}>
             <RefreshCw className={`sync-icon ${loading ? 'spinning' : ''}`} size={14} />
@@ -246,32 +256,42 @@ const AppContent = () => {
         </div>
       </aside>
 
-      {/* Main Content Area */}
       <main className="app-main">
         {selectedTab !== 'simulator' && (
           <header className="main-header">
             <div className="header-title-area">
               <h1 className="header-title">
-                {selectedTab === 'connector_details' 
-                  ? 'Carrier Configuration' 
+                {selectedTab === 'connector_details'
+                  ? 'Carrier Configuration'
                   : privateTabs.find(t => t.id === selectedTab)?.name}
               </h1>
               <p className="header-subtitle">
-                Automated competitive carrier bidding & quote pipeline
+                Automated competitive carrier bidding &amp; quote pipeline
               </p>
             </div>
-            <div className="header-actions">
-              <div className="system-timer">
-                <span className="timer-label">Simulation Speed:</span>
-                <span className="timer-value badge-fast">FAST (1m = 2h)</span>
-              </div>
+            <div className="header-actions flex items-center gap-3">
+              {billingSummary && (
+                <button
+                  onClick={() => setSelectedTab('subscription')}
+                  className="px-3 py-1.5 rounded-lg bg-primary/10 border border-primary/20 text-primary text-xs font-bold hover:bg-primary/20 transition-all"
+                >
+                  {billingSummary.plan_name} &bull; {billingSummary.usage?.quotes_used || 0}/{billingSummary.usage?.quotes_limit || 25} Quotes
+                </button>
+              )}
+              {!isProd && (
+                <div className="system-timer">
+                  <span className="timer-label">Mode:</span>
+                  <span className="timer-value badge-fast">SANDBOX</span>
+                </div>
+              )}
             </div>
           </header>
         )}
 
-
         <div className="content-viewport">
-          {renderActivePage()}
+          <Suspense fallback={<div className="flex items-center justify-center min-h-[240px] text-on-surface-variant text-sm">Loading view...</div>}>
+            {renderActivePage()}
+          </Suspense>
         </div>
       </main>
     </div>

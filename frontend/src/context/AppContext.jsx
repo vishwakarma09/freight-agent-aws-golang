@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect } from 'react'
+import React, { createContext, useContext, useState, useEffect, useCallback } from 'react'
 import * as api from '../services/api'
 
 const AppContext = createContext()
@@ -9,54 +9,85 @@ export const AppProvider = ({ children }) => {
   const [customers, setCustomers] = useState([])
   const [editingCarrierId, setEditingCarrierId] = useState(null)
   const [analytics, setAnalytics] = useState(null)
-  const [loading, setLoading] = useState(true)
+  const [billingSummary, setBillingSummary] = useState(null)
+  const [backendEnv, setBackendEnv] = useState('prod')
+  const [loading, setLoading] = useState(false)
   const [activeQuote, setActiveQuote] = useState(null)
   const [historicalRag, setHistoricalRag] = useState([])
   const [selectedTab, setSelectedTab] = useState('landing')
   const [notifications, setNotifications] = useState([])
+
+  // Clear legacy insecure localStorage key if present
+  useEffect(() => {
+    localStorage.removeItem('userEmail')
+  }, [])
+
   const [isAuthenticated, setIsAuthenticated] = useState(() => {
-    const savedEmail = localStorage.getItem('userEmail')
-    if (savedEmail) {
-      if (api.default && api.default.defaults) {
-        api.default.defaults.headers.common['X-User-Email'] = savedEmail
-      }
-      return true
-    }
-    return false
-  })
-  const [user, setUser] = useState(() => {
-    const savedEmail = localStorage.getItem('userEmail')
-    return savedEmail ? { email: savedEmail, name: savedEmail.split('@')[0] } : null
+    return Boolean(localStorage.getItem('accessToken'))
   })
 
-  const addNotification = (message, type = 'success') => {
-    const id = Date.now()
+  const [user, setUser] = useState(() => {
+    try {
+      const saved = localStorage.getItem('userProfile')
+      return saved ? JSON.parse(saved) : null
+    } catch {
+      return null
+    }
+  })
+
+  const addNotification = useCallback((message, type = 'success') => {
+    const id = Date.now() + Math.random()
     setNotifications(prev => [...prev, { id, message, type }])
     setTimeout(() => {
       setNotifications(prev => prev.filter(n => n.id !== id))
-    }, 4000)
-  }
+    }, 4500)
+  }, [])
 
-  const fetchData = async (showLoading = false) => {
+  // Listen for 401 unauthorized events from Axios interceptor
+  useEffect(() => {
+    const handleUnauthorized = () => {
+      setIsAuthenticated(false)
+      setUser(null)
+      setBillingSummary(null)
+      setSelectedTab('login')
+      addNotification("Session expired. Please sign in again.", "error")
+    }
+    window.addEventListener('auth:unauthorized', handleUnauthorized)
+    return () => window.removeEventListener('auth:unauthorized', handleUnauthorized)
+  }, [addNotification])
+
+  const fetchData = useCallback(async (showLoading = false, analyticsDays = null) => {
+    if (!localStorage.getItem('accessToken')) return
     if (showLoading) setLoading(true)
     try {
-      const [qData, cData, custData, aData] = await Promise.all([
+      const [qData, cData, custData, aData, bData, envData, meData] = await Promise.all([
         api.getQuotes(),
         api.getCarriers(),
         api.getCustomers(),
-        api.getAnalytics()
+        api.getAnalytics(analyticsDays),
+        api.getBillingSummary().catch(() => null),
+        api.getEmailEnv().catch(() => ({ env: 'prod' })),
+        api.getMe().catch(() => null),
       ])
-      setQuotes(qData)
-      setCarriers(cData)
-      setCustomers(custData)
+      setQuotes(qData || [])
+      setCarriers(cData || [])
+      setCustomers(custData || [])
       setAnalytics(aData)
+      if (bData) setBillingSummary(bData)
+      if (envData?.env) setBackendEnv(envData.env)
+      if (meData) {
+        setUser(meData)
+        localStorage.setItem('userProfile', JSON.stringify(meData))
+      }
     } catch (err) {
-      console.error("Failed to load application data:", err)
-      addNotification("Error loading data from server", "error")
+      if (err.response?.status !== 401) {
+        console.error("Failed to load application data:", err)
+        addNotification("Error loading data from server", "error")
+      }
     } finally {
       setLoading(false)
     }
-  }
+  }, [addNotification])
 
   useEffect(() => {
     const publicTabs = ['landing', 'pricing', 'login', 'register']
@@ -67,12 +98,11 @@ export const AppProvider = ({ children }) => {
     }
 
     fetchData(true)
-    // Set up auto-refresh polling every 5 seconds to show state machine progress
     const interval = setInterval(() => {
       fetchData(false)
-    }, 5000)
+    }, 10000)
     return () => clearInterval(interval)
-  }, [isAuthenticated, selectedTab])
+  }, [isAuthenticated, selectedTab, fetchData])
 
   const selectQuote = async (id) => {
     if (!id) {
@@ -86,7 +116,7 @@ export const AppProvider = ({ children }) => {
         api.getHistoricalRag(id)
       ])
       setActiveQuote(detailedQuote)
-      setHistoricalRag(ragData)
+      setHistoricalRag(ragData || [])
     } catch (err) {
       console.error("Failed to fetch detailed quote info:", err)
       addNotification("Failed to load quote details", "error")
@@ -102,8 +132,7 @@ export const AppProvider = ({ children }) => {
         selectQuote(quoteId)
       }
     } catch (err) {
-      console.error("Manual override failed:", err)
-      addNotification("Failed to apply manual override", "error")
+      addNotification(err.response?.data?.detail || "Failed to apply manual override", "error")
     }
   }
 
@@ -116,8 +145,7 @@ export const AppProvider = ({ children }) => {
         selectQuote(quoteId)
       }
     } catch (err) {
-      console.error("Quote resolution action failed:", err)
-      addNotification("Resolution action failed", "error")
+      addNotification(err.response?.data?.detail || "Resolution action failed", "error")
     }
   }
 
@@ -132,8 +160,7 @@ export const AppProvider = ({ children }) => {
       fetchData()
       return response
     } catch (err) {
-      console.error("Mock email ingestion failed:", err)
-      addNotification("Email simulator error: check email fields", "error")
+      addNotification(err.response?.data?.detail || "Email simulator error", "error")
       throw err
     }
   }
@@ -145,8 +172,7 @@ export const AppProvider = ({ children }) => {
       fetchData()
       return response
     } catch (err) {
-      console.error("Fast-forward timers failed:", err)
-      addNotification("Failed to fast-forward timers", "error")
+      addNotification(err.response?.data?.detail || "Failed to fast-forward timers", "error")
       throw err
     }
   }
@@ -154,45 +180,54 @@ export const AppProvider = ({ children }) => {
   const handleResetDatabase = async () => {
     try {
       const response = await api.resetSimulatorDatabase()
-      addNotification(response.message || "Database reset successfully!")
+      addNotification(response.message || "Workspace simulation quotes cleared!")
       fetchData()
       return response
     } catch (err) {
-      console.error("Database reset failed:", err)
-      addNotification("Failed to reset database", "error")
+      addNotification(err.response?.data?.detail || "Failed to reset simulation data", "error")
       throw err
     }
   }
 
+  const completeAuthSession = (accessToken, userObj, successMsg) => {
+    localStorage.setItem('accessToken', accessToken)
+    localStorage.setItem('userProfile', JSON.stringify(userObj))
+    setIsAuthenticated(true)
+    setUser(userObj)
+    addNotification(successMsg, "success")
+    setSelectedTab('dashboard')
+  }
 
   const login = async (email, password) => {
     try {
       const response = await api.login({ email, password })
-      const { user } = response
-      localStorage.setItem('userEmail', user.email)
-      setIsAuthenticated(true)
-      setUser(user)
-      if (api.default && api.default.defaults) {
-        api.default.defaults.headers.common['X-User-Email'] = user.email
-      }
-      addNotification("Logged in successfully! Welcome back.", "success")
-      setSelectedTab('dashboard')
+      completeAuthSession(response.access_token, response.user, "Logged in successfully! Welcome back.")
     } catch (err) {
-      console.error("Login failed:", err)
       const errorMsg = err.response?.data?.detail || "Invalid email or password"
       addNotification(errorMsg, "error")
       throw err
     }
   }
 
-  const register = async (name, email, password) => {
+  const register = async (name, email, password, organizationName = '') => {
     try {
-      const response = await api.register({ name, email, password })
+      const response = await api.register({ name, email, password, organization_name: organizationName })
       addNotification(response.message || "Registration successful! Please check your email to activate.", "success")
       return response
     } catch (err) {
-      console.error("Registration failed:", err)
       const errorMsg = err.response?.data?.detail || "Registration failed"
+      addNotification(errorMsg, "error")
+      throw err
+    }
+  }
+
+  const acceptInvite = async (token, name, password) => {
+    try {
+      const response = await api.acceptInvite({ token, name, password })
+      completeAuthSession(response.access_token, response.user, "Invitation accepted! Welcome to your Organization workspace.")
+      return response
+    } catch (err) {
+      const errorMsg = err.response?.data?.detail || "Could not accept invitation"
       addNotification(errorMsg, "error")
       throw err
     }
@@ -201,33 +236,28 @@ export const AppProvider = ({ children }) => {
   const loginWithGoogle = async (credentialToken) => {
     try {
       const response = await api.googleSSO({ credential: credentialToken })
-      const { user } = response
-      localStorage.setItem('userEmail', user.email)
-      setIsAuthenticated(true)
-      setUser(user)
-      if (api.default && api.default.defaults) {
-        api.default.defaults.headers.common['X-User-Email'] = user.email
-      }
-      addNotification("Logged in with Google successfully!", "success")
-      setSelectedTab('dashboard')
+      completeAuthSession(response.access_token, response.user, "Logged in with Google successfully!")
     } catch (err) {
-      console.error("Google login failed:", err)
-      addNotification("Google Sign-In failed", "error")
+      const errorMsg = err.response?.data?.detail || "Google Sign-In failed"
+      addNotification(errorMsg, "error")
       throw err
     }
   }
 
   const logout = () => {
+    localStorage.removeItem('accessToken')
+    localStorage.removeItem('userProfile')
     localStorage.removeItem('userEmail')
     setIsAuthenticated(false)
     setUser(null)
-    if (api.default && api.default.defaults && api.default.defaults.headers.common['X-User-Email']) {
-      delete api.default.defaults.headers.common['X-User-Email']
-    }
+    setBillingSummary(null)
+    setQuotes([])
+    setCarriers([])
+    setCustomers([])
+    setAnalytics(null)
     addNotification("Logged out successfully.", "success")
     setSelectedTab('landing')
   }
-
 
   const handleSaveCarrier = async (payload) => {
     try {
@@ -242,7 +272,6 @@ export const AppProvider = ({ children }) => {
       fetchData()
       setSelectedTab('connectors_list')
     } catch (err) {
-      console.error("Failed to save carrier:", err)
       const errorMsg = err.response?.data?.detail || "Failed to save carrier"
       addNotification(errorMsg, "error")
     }
@@ -254,8 +283,7 @@ export const AppProvider = ({ children }) => {
       addNotification("Carrier deleted successfully!", "success")
       fetchData()
     } catch (err) {
-      console.error("Failed to delete carrier:", err)
-      addNotification("Failed to delete carrier", "error")
+      addNotification(err.response?.data?.detail || "Failed to delete carrier", "error")
     }
   }
 
@@ -267,6 +295,8 @@ export const AppProvider = ({ children }) => {
       editingCarrierId,
       setEditingCarrierId,
       analytics,
+      billingSummary,
+      backendEnv,
       loading,
       activeQuote,
       historicalRag,
@@ -282,15 +312,14 @@ export const AppProvider = ({ children }) => {
       handleFastForwardTimers,
       handleResetDatabase,
       isAuthenticated,
-
       user,
       login,
       register,
+      acceptInvite,
       loginWithGoogle,
       logout,
       handleSaveCarrier,
       handleDeleteCarrier
-
     }}>
       {children}
     </AppContext.Provider>

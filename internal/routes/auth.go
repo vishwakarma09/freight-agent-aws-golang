@@ -1,15 +1,15 @@
 package routes
 
 import (
-	"crypto/rand"
-	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"html"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
-
-	"encoding/json"
 
 	"github.com/gin-gonic/gin"
 
@@ -21,9 +21,10 @@ import (
 )
 
 type UserRegister struct {
-	Name     string `json:"name" binding:"required"`
-	Email    string `json:"email" binding:"required,email"`
-	Password string `json:"password" binding:"required"`
+	Name             string `json:"name" binding:"required"`
+	Email            string `json:"email" binding:"required,email"`
+	Password         string `json:"password" binding:"required"`
+	OrganizationName string `json:"organization_name"`
 }
 
 type UserLogin struct {
@@ -35,12 +36,30 @@ type GoogleSSORequest struct {
 	Credential string `json:"credential" binding:"required"`
 }
 
+type ForgotPasswordRequest struct {
+	Email string `json:"email" binding:"required,email"`
+}
+
+type ResetPasswordRequest struct {
+	Token       string `json:"token" binding:"required"`
+	NewPassword string `json:"new_password" binding:"required"`
+}
+
+type AcceptInviteRequest struct {
+	Token    string `json:"token" binding:"required"`
+	Name     string `json:"name" binding:"required"`
+	Password string `json:"password" binding:"required"`
+}
+
 type UserResponse struct {
-	ID        uint      `json:"id"`
-	Name      string    `json:"name"`
-	Email     string    `json:"email"`
-	IsActive  bool      `json:"is_active"`
-	CreatedAt time.Time `json:"created_at"`
+	ID             uint                 `json:"id"`
+	OrganizationID uint                 `json:"organization_id"`
+	Role           string               `json:"role"`
+	Name           string               `json:"name"`
+	Email          string               `json:"email"`
+	IsActive       bool                 `json:"is_active"`
+	CreatedAt      time.Time            `json:"created_at"`
+	Organization   *models.Organization `json:"organization,omitempty"`
 }
 
 type UserTokenResponse struct {
@@ -49,16 +68,17 @@ type UserTokenResponse struct {
 	User        UserResponse `json:"user"`
 }
 
+// VerifyGoogleToken verifies a real Google ID token against Google's tokeninfo endpoint.
+// SECURITY FIX (P0-1): Removed the hardcoded "test" / unconfigured-client-id backdoor.
 func VerifyGoogleToken(tokenStr string) (map[string]interface{}, error) {
-	if tokenStr == "test" || config.Settings.GoogleClientID == "YOUR_GOOGLE_CLIENT_ID" || config.Settings.GoogleClientID == "test" {
-		return map[string]interface{}{
-			"email": "broker@dispatch.owera.ca",
-			"name":  "Broker User",
-		}, nil
+	clientID := strings.TrimSpace(config.Settings.GoogleClientID)
+	if clientID == "" || clientID == "YOUR_GOOGLE_CLIENT_ID" || strings.HasPrefix(clientID, "xxxx") {
+		return nil, errors.New("Google Sign-In is not configured on this server")
 	}
 
-	url := fmt.Sprintf("https://oauth2.googleapis.com/tokeninfo?id_token=%s", tokenStr)
-	resp, err := http.Get(url)
+	endpoint := "https://oauth2.googleapis.com/tokeninfo?id_token=" + url.QueryEscape(tokenStr)
+	httpClient := &http.Client{Timeout: 8 * time.Second}
+	resp, err := httpClient.Get(endpoint)
 	if err != nil {
 		return nil, err
 	}
@@ -74,8 +94,13 @@ func VerifyGoogleToken(tokenStr string) (map[string]interface{}, error) {
 	}
 
 	aud, _ := info["aud"].(string)
-	if aud != config.Settings.GoogleClientID {
-		return nil, fmt.Errorf("invalid audience: %s", aud)
+	if aud != clientID {
+		return nil, errors.New("invalid Google token audience")
+	}
+
+	emailVerified, _ := info["email_verified"].(string)
+	if emailVerified != "true" {
+		return nil, errors.New("Google account email is not verified")
 	}
 
 	return info, nil
@@ -84,10 +109,62 @@ func VerifyGoogleToken(tokenStr string) (map[string]interface{}, error) {
 func RegisterAuthRoutes(rg *gin.RouterGroup) {
 	auth := rg.Group("/auth")
 	{
-		auth.POST("/register", registerUser)
+		auth.POST("/register", RateLimitMiddleware(10, time.Minute), registerUser)
 		auth.GET("/activate", activateAccount)
-		auth.POST("/login", loginUser)
-		auth.POST("/google-sso", googleSSO)
+		auth.POST("/login", RateLimitMiddleware(15, time.Minute), loginUser)
+		auth.POST("/google-sso", RateLimitMiddleware(15, time.Minute), googleSSO)
+		auth.POST("/forgot-password", RateLimitMiddleware(5, time.Minute), forgotPassword)
+		auth.POST("/reset-password", RateLimitMiddleware(10, time.Minute), resetPassword)
+		auth.POST("/accept-invite", RateLimitMiddleware(10, time.Minute), acceptInvite)
+		auth.GET("/me", AuthMiddleware(), getMe)
+	}
+}
+
+func createPersonalOrganization(name string, email string) (*models.Organization, error) {
+	orgName := strings.TrimSpace(name)
+	if orgName == "" {
+		orgName = strings.Split(email, "@")[0] + " Freight"
+	}
+	randSuffix, _ := utils.GenerateRandomToken(4)
+	slug := fmt.Sprintf("org-%s", randSuffix)
+	trialEnd := time.Now().UTC().AddDate(0, 0, 14)
+
+	r1 := 120
+	r2 := 30
+	if !config.Settings.IsProd() {
+		r1 = 2
+		r2 = 1
+	}
+
+	org := models.Organization{
+		Name:                  orgName,
+		Slug:                  slug,
+		PlanTier:              "free",
+		BillingStatus:         "trialing",
+		TrialEndsAt:           &trialEnd,
+		SeatLimit:             1,
+		CarrierLimit:          10,
+		InboxLimit:            1,
+		MonthlyQuoteLimit:     25,
+		Round1DurationMinutes: r1,
+		Round2DurationMinutes: r2,
+	}
+	if err := db.DB.Create(&org).Error; err != nil {
+		return nil, err
+	}
+	return &org, nil
+}
+
+func toUserResponse(user *models.User) UserResponse {
+	return UserResponse{
+		ID:             user.ID,
+		OrganizationID: user.OrganizationID,
+		Role:           user.Role,
+		Name:           user.Name,
+		Email:          user.Email,
+		IsActive:       user.IsActive,
+		CreatedAt:      user.CreatedAt,
+		Organization:   user.Organization,
 	}
 }
 
@@ -98,7 +175,13 @@ func registerUser(c *gin.Context) {
 		return
 	}
 
+	if err := utils.ValidatePasswordStrength(payload.Password); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+
 	emailClean := strings.ToLower(strings.TrimSpace(payload.Email))
+	nameClean := strings.TrimSpace(payload.Name)
 
 	var existing models.User
 	if err := db.DB.Where("LOWER(email) = LOWER(?)", emailClean).First(&existing).Error; err == nil {
@@ -106,10 +189,13 @@ func registerUser(c *gin.Context) {
 		return
 	}
 
-	// Generate activation token
-	tokenBytes := make([]byte, 16)
-	_, _ = rand.Read(tokenBytes)
-	token := hex.EncodeToString(tokenBytes)
+	token, err := utils.GenerateRandomToken(24)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Failed to generate activation token"})
+		return
+	}
+	tokenHash := utils.HashToken(token)
+	expiresAt := time.Now().UTC().Add(24 * time.Hour)
 
 	hashedPassword, err := utils.HashPassword(payload.Password)
 	if err != nil {
@@ -117,12 +203,25 @@ func registerUser(c *gin.Context) {
 		return
 	}
 
+	orgLabel := payload.OrganizationName
+	if orgLabel == "" {
+		orgLabel = nameClean + "'s Workspace"
+	}
+	org, err := createPersonalOrganization(orgLabel, emailClean)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Failed to create workspace"})
+		return
+	}
+
 	user := models.User{
-		Name:            payload.Name,
-		Email:           emailClean,
-		HashedPassword:  &hashedPassword,
-		IsActive:        false,
-		ActivationToken: &token,
+		OrganizationID:      org.ID,
+		Role:                "owner",
+		Name:                nameClean,
+		Email:               emailClean,
+		HashedPassword:      &hashedPassword,
+		IsActive:            false,
+		ActivationToken:     &tokenHash,
+		ActivationExpiresAt: &expiresAt,
 	}
 
 	if err := db.DB.Create(&user).Error; err != nil {
@@ -130,121 +229,39 @@ func registerUser(c *gin.Context) {
 		return
 	}
 
-	// Determine activation link
-	scheme := "http"
-	if c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https" {
-		scheme = "https"
+	baseURL := strings.TrimRight(config.Settings.FrontendURL, "/")
+	if baseURL == "" {
+		baseURL = "https://freight.owera.ca"
 	}
-	host := c.Request.Host
-	activationLink := fmt.Sprintf("%s://%s/api/auth/activate?token=%s", scheme, host, token)
+	activationLink := fmt.Sprintf("%s/api/auth/activate?token=%s", baseURL, url.QueryEscape(token))
 	year := time.Now().Year()
 
 	subject := "Activate Your Dispatch Account"
 	bodyHTML := fmt.Sprintf(`<!DOCTYPE html>
 <html>
-<head>
-  <style>
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-      line-height: 1.6;
-      color: #333333;
-      margin: 0;
-      padding: 0;
-      background-color: #f9f9fb;
-    }
-    .container {
-      max-width: 600px;
-      margin: 40px auto;
-      background: #ffffff;
-      border: 1px solid #e1e1e8;
-      border-radius: 12px;
-      overflow: hidden;
-      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05);
-    }
-    .header {
-      background-color: #0f172a;
-      color: #ffffff;
-      padding: 30px;
-      text-align: center;
-    }
-    .header h1 {
-      margin: 0;
-      font-size: 24px;
-      font-weight: 700;
-      letter-spacing: -0.5px;
-      color: #38bdf8;
-    }
-    .header p {
-      margin: 5px 0 0 0;
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 2px;
-      color: #94a3b8;
-    }
-    .content {
-      padding: 40px 30px;
-    }
-    .content h2 {
-      margin-top: 0;
-      font-size: 20px;
-      color: #0f172a;
-    }
-    .content p {
-      color: #475569;
-      font-size: 15px;
-      margin-bottom: 24px;
-    }
-    .button-container {
-      text-align: center;
-      margin: 35px 0;
-    }
-    .btn-primary {
-      display: inline-block;
-      background-color: #0ea5e9;
-      color: #ffffff !important;
-      padding: 14px 28px;
-      font-size: 15px;
-      font-weight: 600;
-      text-decoration: none;
-      border-radius: 8px;
-      box-shadow: 0 4px 6px -1px rgba(14, 165, 233, 0.2);
-    }
-    .footer {
-      background-color: #f8fafc;
-      padding: 20px 30px;
-      border-top: 1px solid #f1f5f9;
-      font-size: 12px;
-      color: #64748b;
-      text-align: center;
-    }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <div class="header">
-      <h1>DISPATCH</h1>
-      <p>Enterprise Logistics Terminal</p>
+<body style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#f8fafc;padding:24px;color:#0f172a;">
+  <div style="max-width:580px;margin:0 auto;background:#fff;border:1px solid #e2e8f0;border-radius:12px;overflow:hidden;">
+    <div style="background:#0f172a;color:#fff;padding:24px;text-align:center;">
+      <h1 style="margin:0;color:#38bdf8;">DISPATCH</h1>
+      <p style="margin:4px 0 0;font-size:11px;letter-spacing:2px;color:#94a3b8;">ENTERPRISE LOGISTICS TERMINAL</p>
     </div>
-    <div class="content">
+    <div style="padding:32px;">
       <h2>Verify your email address</h2>
       <p>Hello %s,</p>
-      <p>Thank you for signing up for Dispatch. To complete your registration and activate your freight brokerage and bidding orchestrator account, please click the button below:</p>
-      <div class="button-container">
-        <a href="%s" class="btn-primary" style="color: #ffffff !important;">Activate Account</a>
-      </div>
-      <p>If the button doesn't work, you can copy and paste the following URL into your web browser:</p>
-      <p style="word-break: break-all; font-family: monospace; background: #f1f5f9; padding: 12px; border-radius: 6px; font-size: 13px; color: #334155;">%s</p>
+      <p>Click below to activate your Dispatch account (link expires in 24 hours):</p>
+      <p style="text-align:center;margin:28px 0;">
+        <a href="%s" style="background:#0ea5e9;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:600;">Activate Account</a>
+      </p>
+      <p style="font-size:12px;color:#64748b;word-break:break-all;">%s</p>
     </div>
-    <div class="footer">
-      &copy; %d Dispatch Inc. All rights reserved.<br>
-      This is an automated notification. Please do not reply directly to this email.
+    <div style="background:#f8fafc;padding:16px;text-align:center;font-size:12px;color:#64748b;">
+      &copy; %d Dispatch Inc. All rights reserved.
     </div>
   </div>
 </body>
-</html>`, payload.Name, activationLink, activationLink, year)
+</html>`, html.EscapeString(nameClean), html.EscapeString(activationLink), html.EscapeString(activationLink), year)
 
-	emailSent := services.SendEmail(user.Email, subject, bodyHTML, "")
-	if !emailSent {
+	if !services.SendEmail(user.Email, subject, bodyHTML, "") {
 		log.Printf("Could not send activation email to %s\n", user.Email)
 	}
 
@@ -255,21 +272,33 @@ func registerUser(c *gin.Context) {
 }
 
 func activateAccount(c *gin.Context) {
-	token := c.Query("token")
-	frontendURL := config.Settings.FrontendURL
+	rawToken := strings.TrimSpace(c.Query("token"))
+	frontendURL := strings.TrimRight(config.Settings.FrontendURL, "/")
 	if frontendURL == "" {
-		frontendURL = "http://localhost:5173"
+		frontendURL = "https://freight.owera.ca"
 	}
 
-	var user models.User
-	if err := db.DB.Where("activation_token = ?", token).First(&user).Error; err != nil {
-		log.Printf("Invalid activation token requested: %s\n", token)
+	if rawToken == "" {
 		c.Redirect(http.StatusFound, frontendURL+"/?activation_error=invalid_token")
+		return
+	}
+
+	tokenHash := utils.HashToken(rawToken)
+	var user models.User
+	// Match hashed token (or legacy unhashed token created before migration)
+	if err := db.DB.Where("activation_token = ? OR activation_token = ?", tokenHash, rawToken).First(&user).Error; err != nil {
+		c.Redirect(http.StatusFound, frontendURL+"/?activation_error=invalid_token")
+		return
+	}
+
+	if user.ActivationExpiresAt != nil && time.Now().UTC().After(*user.ActivationExpiresAt) {
+		c.Redirect(http.StatusFound, frontendURL+"/?activation_error=expired_token")
 		return
 	}
 
 	user.IsActive = true
 	user.ActivationToken = nil
+	user.ActivationExpiresAt = nil
 	db.DB.Save(&user)
 
 	log.Printf("User account activated: %s\n", user.Email)
@@ -286,12 +315,12 @@ func loginUser(c *gin.Context) {
 	emailClean := strings.ToLower(strings.TrimSpace(payload.Email))
 
 	var user models.User
-	if err := db.DB.Where("LOWER(email) = LOWER(?)", emailClean).First(&user).Error; err != nil {
+	if err := db.DB.Preload("Organization").Where("LOWER(email) = LOWER(?)", emailClean).First(&user).Error; err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"detail": "Invalid email or password"})
 		return
 	}
 
-	if user.HashedPassword == nil {
+	if user.HashedPassword == nil || *user.HashedPassword == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"detail": "This account uses Google Sign-In. Please click 'Continue with Google' to sign in."})
 		return
 	}
@@ -306,16 +335,16 @@ func loginUser(c *gin.Context) {
 		return
 	}
 
+	accessToken, err := utils.GenerateAccessToken(user.ID, user.Email, user.OrganizationID, user.Role)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Failed to issue session token"})
+		return
+	}
+
 	c.JSON(http.StatusOK, UserTokenResponse{
-		AccessToken: user.Email,
+		AccessToken: accessToken,
 		TokenType:   "bearer",
-		User: UserResponse{
-			ID:        user.ID,
-			Name:      user.Name,
-			Email:     user.Email,
-			IsActive:  user.IsActive,
-			CreatedAt: user.CreatedAt,
-		},
+		User:        toUserResponse(&user),
 	})
 }
 
@@ -334,7 +363,6 @@ func googleSSO(c *gin.Context) {
 
 	email, _ := idinfo["email"].(string)
 	name, _ := idinfo["name"].(string)
-
 	if email == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"detail": "Email not provided by Google token"})
 		return
@@ -346,31 +374,213 @@ func googleSSO(c *gin.Context) {
 	}
 
 	var user models.User
-	err = db.DB.Where("LOWER(email) = LOWER(?)", emailClean).First(&user).Error
-
+	err = db.DB.Preload("Organization").Where("LOWER(email) = LOWER(?)", emailClean).First(&user).Error
 	if err != nil {
-		// Create SSO User
+		org, orgErr := createPersonalOrganization(name+"'s Workspace", emailClean)
+		if orgErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"detail": "Failed to provision workspace"})
+			return
+		}
 		user = models.User{
+			OrganizationID: org.ID,
+			Role:           "owner",
 			Name:           name,
 			Email:          emailClean,
 			HashedPassword: nil,
 			IsActive:       true,
+			Organization:   org,
 		}
-		db.DB.Create(&user)
-	} else {
-		if !user.IsActive {
-			user.IsActive = true
-			user.ActivationToken = nil
-			db.DB.Save(&user)
+		if err := db.DB.Create(&user).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"detail": "Failed to create Google SSO account"})
+			return
 		}
+	} else if !user.IsActive {
+		user.IsActive = true
+		user.ActivationToken = nil
+		user.ActivationExpiresAt = nil
+		db.DB.Save(&user)
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"access_token": payload.Credential,
-		"token_type":   "bearer",
-		"user": gin.H{
-			"email": user.Email,
-			"name":  user.Name,
-		},
+	accessToken, err := utils.GenerateAccessToken(user.ID, user.Email, user.OrganizationID, user.Role)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Failed to issue session token"})
+		return
+	}
+
+	c.JSON(http.StatusOK, UserTokenResponse{
+		AccessToken: accessToken,
+		TokenType:   "bearer",
+		User:        toUserResponse(&user),
 	})
+}
+
+func forgotPassword(c *gin.Context) {
+	var payload ForgotPasswordRequest
+	if err := c.ShouldBindJSON(&payload); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+
+	emailClean := strings.ToLower(strings.TrimSpace(payload.Email))
+	// Always return generic 200 response to avoid account enumeration
+	genericResp := gin.H{
+		"status":  "success",
+		"message": "If an account exists for that email, a password reset link has been sent.",
+	}
+
+	var user models.User
+	if err := db.DB.Where("LOWER(email) = LOWER(?)", emailClean).First(&user).Error; err != nil {
+		c.JSON(http.StatusOK, genericResp)
+		return
+	}
+
+	rawToken, err := utils.GenerateRandomToken(24)
+	if err != nil {
+		c.JSON(http.StatusOK, genericResp)
+		return
+	}
+	tokenHash := utils.HashToken(rawToken)
+	exp := time.Now().UTC().Add(1 * time.Hour)
+	user.ResetTokenHash = &tokenHash
+	user.ResetTokenExpiresAt = &exp
+	db.DB.Save(&user)
+
+	resetLink := fmt.Sprintf("%s/login?reset_token=%s", strings.TrimRight(config.Settings.FrontendURL, "/"), url.QueryEscape(rawToken))
+	bodyHTML := fmt.Sprintf(`<!DOCTYPE html>
+<html><body style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;padding:24px;color:#0f172a;">
+<h2>Reset Your Dispatch Password</h2>
+<p>Hello %s,</p>
+<p>We received a request to reset your password. This link expires in 1 hour:</p>
+<p><a href="%s" style="background:#0ea5e9;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:600;">Reset Password</a></p>
+<p style="font-size:12px;color:#64748b;">If you did not request this, you can safely ignore this email.</p>
+</body></html>`, html.EscapeString(user.Name), html.EscapeString(resetLink))
+
+	services.SendEmail(user.Email, "Reset Your Dispatch Password", bodyHTML, "")
+	c.JSON(http.StatusOK, genericResp)
+}
+
+func resetPassword(c *gin.Context) {
+	var payload ResetPasswordRequest
+	if err := c.ShouldBindJSON(&payload); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+
+	if err := utils.ValidatePasswordStrength(payload.NewPassword); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+
+	tokenHash := utils.HashToken(strings.TrimSpace(payload.Token))
+	var user models.User
+	if err := db.DB.Where("reset_token_hash = ?", tokenHash).First(&user).Error; err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "Invalid or expired password reset token"})
+		return
+	}
+
+	if user.ResetTokenExpiresAt == nil || time.Now().UTC().After(*user.ResetTokenExpiresAt) {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "Password reset token has expired"})
+		return
+	}
+
+	hashed, err := utils.HashPassword(payload.NewPassword)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Failed to secure password"})
+		return
+	}
+
+	user.HashedPassword = &hashed
+	user.IsActive = true
+	user.ResetTokenHash = nil
+	user.ResetTokenExpiresAt = nil
+	db.DB.Save(&user)
+
+	c.JSON(http.StatusOK, gin.H{"status": "success", "message": "Password updated successfully. You may now sign in."})
+}
+
+func acceptInvite(c *gin.Context) {
+	var payload AcceptInviteRequest
+	if err := c.ShouldBindJSON(&payload); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+	if err := utils.ValidatePasswordStrength(payload.Password); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+
+	tokenHash := utils.HashToken(strings.TrimSpace(payload.Token))
+	var invite models.OrganizationInvite
+	if err := db.DB.Where("token_hash = ? AND accepted_at IS NULL", tokenHash).First(&invite).Error; err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "Invalid or already used invitation token"})
+		return
+	}
+	if time.Now().UTC().After(invite.ExpiresAt) {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "This invitation has expired"})
+		return
+	}
+
+	var org models.Organization
+	if err := db.DB.First(&org, invite.OrganizationID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"detail": "Organization no longer exists"})
+		return
+	}
+	if org.PlanTier != "enterprise" {
+		c.JSON(http.StatusPaymentRequired, gin.H{"detail": "Multi-seat Organization access requires an active Enterprise plan"})
+		return
+	}
+
+	var seatCount int64
+	db.DB.Model(&models.User{}).Where("organization_id = ?", org.ID).Count(&seatCount)
+	if int(seatCount) >= org.SeatLimit {
+		c.JSON(http.StatusPaymentRequired, gin.H{"detail": "Organization seat limit reached"})
+		return
+	}
+
+	var existing models.User
+	if err := db.DB.Where("LOWER(email) = LOWER(?)", invite.Email).First(&existing).Error; err == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "An account with this email already exists"})
+		return
+	}
+
+	hashed, err := utils.HashPassword(payload.Password)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Failed to secure password"})
+		return
+	}
+
+	user := models.User{
+		OrganizationID: org.ID,
+		Role:           invite.Role,
+		Name:           strings.TrimSpace(payload.Name),
+		Email:          strings.ToLower(strings.TrimSpace(invite.Email)),
+		HashedPassword: &hashed,
+		IsActive:       true,
+		Organization:   &org,
+	}
+	if err := db.DB.Create(&user).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Failed to create team member account"})
+		return
+	}
+
+	now := time.Now().UTC()
+	invite.AcceptedAt = &now
+	db.DB.Save(&invite)
+
+	accessToken, err := utils.GenerateAccessToken(user.ID, user.Email, user.OrganizationID, user.Role)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Failed to issue session token"})
+		return
+	}
+
+	c.JSON(http.StatusOK, UserTokenResponse{
+		AccessToken: accessToken,
+		TokenType:   "bearer",
+		User:        toUserResponse(&user),
+	})
+}
+
+func getMe(c *gin.Context) {
+	user, _ := GetCurrentUser(c)
+	c.JSON(http.StatusOK, toUserResponse(user))
 }

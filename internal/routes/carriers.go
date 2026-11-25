@@ -1,6 +1,7 @@
 package routes
 
 import (
+	"fmt"
 	"math"
 	"net/http"
 	"strconv"
@@ -21,25 +22,29 @@ type CarrierCreate struct {
 	SimulatedScore       float64 `json:"simulated_score"`
 }
 
-func getCarrierCalculatedScore(gdb *gorm.DB, carrierID uint) float64 {
+func getCarrierCalculatedScore(gdb *gorm.DB, orgID uint, carrierID uint) float64 {
 	var totalBids int64
-	gdb.Model(&models.CarrierBid{}).Where("carrier_id = ?", carrierID).Count(&totalBids)
+	gdb.Model(&models.CarrierBid{}).
+		Joins("JOIN freight_quotes ON freight_quotes.id = carrier_bids.freight_quote_id").
+		Where("carrier_bids.carrier_id = ? AND freight_quotes.organization_id = ?", carrierID, orgID).
+		Count(&totalBids)
 
 	var wins int64
-	gdb.Model(&models.FreightQuote{}).Where("winning_carrier_id = ?", carrierID).Count(&wins)
+	gdb.Model(&models.FreightQuote{}).
+		Where("winning_carrier_id = ? AND organization_id = ?", carrierID, orgID).
+		Count(&wins)
 
 	winRatePct := 0.0
 	if totalBids > 0 {
 		winRatePct = float64(wins) / float64(totalBids) * 100.0
 	}
 
-	// Calculate win rate percentage clamped and scaled to [0.0, 10.0], rounded to 1 decimal place
 	score := math.Round(winRatePct/10.0*10.0) / 10.0
 	return score
 }
 
-func populateCarrierScores(gdb *gorm.DB, carrier *models.Carrier) {
-	carrier.CalculatedCompetitivenessScore = getCarrierCalculatedScore(gdb, carrier.ID)
+func populateCarrierScores(gdb *gorm.DB, orgID uint, carrier *models.Carrier) {
+	carrier.CalculatedCompetitivenessScore = getCarrierCalculatedScore(gdb, orgID, carrier.ID)
 	if carrier.IsOverride {
 		carrier.CompetitivenessScore = carrier.SimulatedScore
 	} else {
@@ -58,16 +63,16 @@ func RegisterCarrierRoutes(rg *gin.RouterGroup) {
 }
 
 func getCarriers(c *gin.Context) {
-	currentUser, _ := GetCurrentUser(c)
+	org, _ := GetCurrentOrg(c)
 
 	var carriers []models.Carrier
-	if err := db.DB.Where("user_id = ?", currentUser.ID).Find(&carriers).Error; err != nil {
+	if err := db.DB.Where("organization_id = ?", org.ID).Find(&carriers).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Failed to query carriers"})
 		return
 	}
 
 	for i := range carriers {
-		populateCarrierScores(db.DB, &carriers[i])
+		populateCarrierScores(db.DB, org.ID, &carriers[i])
 	}
 
 	c.JSON(http.StatusOK, carriers)
@@ -75,6 +80,19 @@ func getCarriers(c *gin.Context) {
 
 func createCarrier(c *gin.Context) {
 	currentUser, _ := GetCurrentUser(c)
+	org, _ := GetCurrentOrg(c)
+
+	// Enforce Option A carrier limit (-1 means unlimited)
+	if org.CarrierLimit > 0 {
+		var count int64
+		db.DB.Model(&models.Carrier{}).Where("organization_id = ?", org.ID).Count(&count)
+		if int(count) >= org.CarrierLimit {
+			c.JSON(http.StatusPaymentRequired, gin.H{
+				"detail": fmt.Sprintf("Plan carrier limit reached (%d/%d). Upgrade your plan in Subscription & Usage to add more carriers.", count, org.CarrierLimit),
+			})
+			return
+		}
+	}
 
 	var payload CarrierCreate
 	if err := c.ShouldBindJSON(&payload); err != nil {
@@ -84,17 +102,16 @@ func createCarrier(c *gin.Context) {
 
 	emailClean := strings.ToLower(strings.TrimSpace(payload.Email))
 
-	// Check if already registered
 	var existing models.Carrier
-	err := db.DB.Where("email = ? AND user_id = ?", emailClean, currentUser.ID).First(&existing).Error
-	if err == nil {
-		c.JSON(http.StatusBadRequest, gin.H{"detail": "Carrier email already registered for this user"})
+	if err := db.DB.Where("LOWER(email) = ? AND organization_id = ?", emailClean, org.ID).First(&existing).Error; err == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "Carrier email already registered in your workspace"})
 		return
 	}
 
 	carrier := models.Carrier{
+		OrganizationID:       org.ID,
 		UserID:               &currentUser.ID,
-		Name:                 payload.Name,
+		Name:                 strings.TrimSpace(payload.Name),
 		Email:                emailClean,
 		CompetitivenessScore: payload.CompetitivenessScore,
 		IsOverride:           payload.IsOverride,
@@ -106,14 +123,13 @@ func createCarrier(c *gin.Context) {
 		return
 	}
 
-	populateCarrierScores(db.DB, &carrier)
+	populateCarrierScores(db.DB, org.ID, &carrier)
 	c.JSON(http.StatusOK, carrier)
 }
 
 func updateCarrier(c *gin.Context) {
-	currentUser, _ := GetCurrentUser(c)
-	carrierIDStr := c.Param("carrier_id")
-	carrierID, err := strconv.ParseUint(carrierIDStr, 10, 64)
+	org, _ := GetCurrentOrg(c)
+	carrierID, err := strconv.ParseUint(c.Param("carrier_id"), 10, 64)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"detail": "Invalid carrier ID"})
 		return
@@ -126,13 +142,12 @@ func updateCarrier(c *gin.Context) {
 	}
 
 	var carrier models.Carrier
-	err = db.DB.Where("id = ? AND user_id = ?", carrierID, currentUser.ID).First(&carrier).Error
-	if err != nil {
+	if err := db.DB.Where("id = ? AND organization_id = ?", carrierID, org.ID).First(&carrier).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"detail": "Carrier not found"})
 		return
 	}
 
-	carrier.Name = payload.Name
+	carrier.Name = strings.TrimSpace(payload.Name)
 	carrier.Email = strings.ToLower(strings.TrimSpace(payload.Email))
 	carrier.IsOverride = payload.IsOverride
 	carrier.SimulatedScore = payload.SimulatedScore
@@ -140,7 +155,7 @@ func updateCarrier(c *gin.Context) {
 	if carrier.IsOverride {
 		carrier.CompetitivenessScore = payload.SimulatedScore
 	} else {
-		carrier.CompetitivenessScore = getCarrierCalculatedScore(db.DB, carrier.ID)
+		carrier.CompetitivenessScore = getCarrierCalculatedScore(db.DB, org.ID, carrier.ID)
 	}
 
 	if err := db.DB.Save(&carrier).Error; err != nil {
@@ -148,22 +163,20 @@ func updateCarrier(c *gin.Context) {
 		return
 	}
 
-	populateCarrierScores(db.DB, &carrier)
+	populateCarrierScores(db.DB, org.ID, &carrier)
 	c.JSON(http.StatusOK, carrier)
 }
 
 func deleteCarrier(c *gin.Context) {
-	currentUser, _ := GetCurrentUser(c)
-	carrierIDStr := c.Param("carrier_id")
-	carrierID, err := strconv.ParseUint(carrierIDStr, 10, 64)
+	org, _ := GetCurrentOrg(c)
+	carrierID, err := strconv.ParseUint(c.Param("carrier_id"), 10, 64)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"detail": "Invalid carrier ID"})
 		return
 	}
 
 	var carrier models.Carrier
-	err = db.DB.Where("id = ? AND user_id = ?", carrierID, currentUser.ID).First(&carrier).Error
-	if err != nil {
+	if err := db.DB.Where("id = ? AND organization_id = ?", carrierID, org.ID).First(&carrier).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"detail": "Carrier not found"})
 		return
 	}

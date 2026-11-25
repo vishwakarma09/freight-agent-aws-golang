@@ -422,7 +422,7 @@ const CarriersList = () => {
           </div>
           <div>
             <span className="text-[10px] font-bold text-on-surface-variant uppercase block">Encryption Channel</span>
-            <span className="text-base font-bold text-on-surface mt-0.5">AES-256 Verified stream</span>
+            <span className="text-base font-bold text-on-surface mt-0.5">AES-256-GCM / AWS KMS</span>
           </div>
         </div>
       </div>
@@ -444,7 +444,7 @@ const CarriersList = () => {
             </div>
             
             <p className="text-xs text-on-surface-variant leading-relaxed">
-              Authenticate your email inbox. The CargoFlux parsing pipeline relies on secure IMAP synchronization to poll incoming messages, extract freight rates, and broadcast RFQs automatically.
+              Authenticate your email inbox. The Dispatch parsing pipeline relies on secure IMAP synchronization (TLS 1.2+) to poll incoming messages, extract freight rates, and broadcast RFQs automatically.
             </p>
 
             <form onSubmit={handleSaveEmailCreds} className="flex flex-col gap-5">

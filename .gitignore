@@ -1,17 +1,20 @@
 # Go Binaries
 bin/
 
-# Environment configurations
+# Environment & Secrets files (NEVER commit)
 .env
 .env.*
+frontend/.env
+frontend/.env.*
 !.env.example
+!frontend/.env.example
 
 # Node / Frontend dependencies & builds
 node_modules/
 frontend/node_modules/
 frontend/dist/
 
-# Serverless Framework directories
+# Serverless Framework state (contains resolved stack templates)
 .serverless/
 
 # OS-specific files

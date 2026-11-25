@@ -1,15 +1,7 @@
 #!/bin/bash
-# Exit on error
-set -e
+set -euo pipefail
 
-# Load root .env file if it exists
-if [ -f .env ]; then
-  export $(grep -v '^#' .env | xargs)
-fi
-
-STAGE=${1:-dev}
-
-# Determine AWS Region (default to us-east-2 as defined in serverless.yml)
+STAGE=${1:-prod}
 AWS_REGION=${AWS_REGION:-us-east-2}
 
 echo "Retrieving AWS Account ID..."
@@ -18,30 +10,29 @@ BUCKET_NAME="freight-agent-frontend-go-${STAGE}-${AWS_ACCOUNT_ID}"
 
 echo "Target Frontend S3 Bucket: ${BUCKET_NAME}"
 
-# Fetch API URL from .env, or try to get it from serverless info if not set
-if [ -z "$API_URL" ]; then
-  echo "API_URL not found in .env. Attempting to fetch from Serverless deployment info..."
-  API_URL=$(npx serverless info --stage ${STAGE} --region ${AWS_REGION} | grep -oE "https://[a-zA-Z0-9.-]+\.execute-api\.[a-z0-9-]+\.amazonaws\.com" | head -n 1)
-fi
-
-if [ -z "$API_URL" ]; then
-  echo "Error: Could not determine API_URL. Please set it in your .env file or deploy the backend first."
-  exit 1
-fi
-
-echo "Backend API URL: ${API_URL}"
-
-# Build the frontend
-echo "Installing frontend dependencies..."
+# NOTE: Never source root backend .env into the frontend build shell.
+# Frontend production config is read exclusively from gitignored frontend/.env.production.
 cd frontend
-npm install --legacy-peer-deps
 
-echo "Building frontend with Vite..."
-VITE_API_URL="${API_URL}" npm run build
+echo "Installing frontend dependencies cleanly (npm ci)..."
+npm ci
 
-# Deploy to S3
+echo "Building production frontend with Vite (reads frontend/.env.production)..."
+npm run build -- --mode production
+
 echo "Uploading assets to S3 bucket ${BUCKET_NAME}..."
 aws s3 sync dist/ "s3://${BUCKET_NAME}" --delete
 
+CF_DIST_ID=$(aws cloudformation describe-stacks \
+  --stack-name "freight-agent-api-go-${STAGE}" \
+  --region "${AWS_REGION}" \
+  --query "Stacks[0].Outputs[?OutputKey=='CloudFrontDistributionId'].OutputValue" \
+  --output text 2>/dev/null || true)
+
+if [ -n "${CF_DIST_ID}" ] && [ "${CF_DIST_ID}" != "None" ]; then
+  echo "Invalidating CloudFront cache (${CF_DIST_ID})..."
+  aws cloudfront create-invalidation --distribution-id "${CF_DIST_ID}" --paths "/*" >/dev/null 2>&1 || echo "Skipping CloudFront invalidation (optional)."
+fi
+
 echo "Deployment complete!"
-echo "Frontend website is available at: http://${BUCKET_NAME}.s3-website.${AWS_REGION}.amazonaws.com/"
+echo "Application is live at: https://freight.owera.ca"

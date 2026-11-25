@@ -3,12 +3,13 @@ package routes
 import (
 	"crypto/tls"
 	"fmt"
+	"net"
 	"net/http"
 	"net/smtp"
 	"strings"
 	"time"
 
-	"github.com/emersion/go-imap/client"
+	"github.com/emersion/go-imap/v2/imapclient"
 	"github.com/gin-gonic/gin"
 
 	"github.com/vishwakarma09/freight-agent-aws-golang/internal/config"
@@ -38,6 +39,9 @@ func cleanStr(val string) string {
 }
 
 func checkMailpitService() bool {
+	if config.Settings.IsProd() {
+		return false
+	}
 	mailpitHost := config.Settings.SMTPHost
 	url := "http://mailpit:8025/api/v1/messages"
 	if mailpitHost != "mailpit" {
@@ -53,29 +57,32 @@ func checkMailpitService() bool {
 	return resp.StatusCode == http.StatusOK
 }
 
+// checkSMTP verifies SMTP connectivity with SSRF protection, 8s dial timeout, and strict TLS 1.2 verification.
 func checkSMTP(host string, port int, email, password string) (bool, string) {
 	host = cleanStr(host)
 	email = cleanStr(email)
 	password = cleanStr(password)
-	addr := fmt.Sprintf("%s:%d", host, port)
 
-	// Validate ASCII password encoding
-	isASCII := true
+	allowedPorts := []int{465, 587}
+	if !config.Settings.IsProd() {
+		allowedPorts = []int{465, 587, 1025}
+	}
+	if err := utils.ValidateExternalHostPort(host, port, allowedPorts, !config.Settings.IsProd()); err != nil {
+		return false, err.Error()
+	}
+
 	for i := 0; i < len(password); i++ {
 		if password[i] > 127 {
-			isASCII = false
-			break
+			return false, "Password contains invalid non-ASCII characters. Please re-type it manually."
 		}
 	}
-	if !isASCII {
-		return false, "Password or email contains invalid non-ASCII characters. Please re-type it manually."
-	}
 
-	var err error
+	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
+	dialer := &net.Dialer{Timeout: 8 * time.Second}
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: host}
+
 	if port == 465 {
-		tlsConfig := &tls.Config{InsecureSkipVerify: true, ServerName: host}
-		var conn *tls.Conn
-		conn, err = tls.Dial("tcp", addr, tlsConfig)
+		conn, err := tls.DialWithDialer(dialer, "tcp", addr, tlsConfig)
 		if err != nil {
 			return false, err.Error()
 		}
@@ -92,14 +99,19 @@ func checkSMTP(host string, port int, email, password string) (bool, string) {
 			return false, err.Error()
 		}
 	} else {
-		c, err := smtp.Dial(addr)
+		conn, err := dialer.Dial("tcp", addr)
+		if err != nil {
+			return false, err.Error()
+		}
+		defer conn.Close()
+
+		c, err := smtp.NewClient(conn, host)
 		if err != nil {
 			return false, err.Error()
 		}
 		defer c.Close()
 
 		if port == 587 {
-			tlsConfig := &tls.Config{InsecureSkipVerify: true, ServerName: host}
 			if err := c.StartTLS(tlsConfig); err != nil {
 				return false, err.Error()
 			}
@@ -114,27 +126,39 @@ func checkSMTP(host string, port int, email, password string) (bool, string) {
 	return true, "SMTP connection OK"
 }
 
+// checkIMAP verifies IMAP connectivity using go-imap/v2 with SSRF protection and strict TLS 1.2 verification.
 func checkIMAP(host string, port int, email, password string) (bool, string) {
 	host = cleanStr(host)
 	email = cleanStr(email)
 	password = cleanStr(password)
-	addr := fmt.Sprintf("%s:%d", host, port)
 
-	var c *client.Client
+	allowedPorts := []int{993}
+	if !config.Settings.IsProd() {
+		allowedPorts = []int{993, 143}
+	}
+	if err := utils.ValidateExternalHostPort(host, port, allowedPorts, !config.Settings.IsProd()); err != nil {
+		return false, err.Error()
+	}
+
+	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
+	var c *imapclient.Client
 	var err error
 	if port == 993 {
-		c, err = client.DialTLS(addr, nil)
+		c, err = imapclient.DialTLS(addr, &imapclient.Options{
+			TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12, ServerName: host},
+		})
 	} else {
-		c, err = client.Dial(addr)
+		c, err = imapclient.DialInsecure(addr, nil)
 	}
 	if err != nil {
 		return false, err.Error()
 	}
-	defer c.Logout()
+	defer c.Close()
 
-	if err := c.Login(email, password); err != nil {
+	if err := c.Login(email, password).Wait(); err != nil {
 		return false, err.Error()
 	}
+	_ = c.Logout().Wait()
 
 	return true, "IMAP connection OK"
 }
@@ -152,11 +176,14 @@ func RegisterEmailCredentialRoutes(rg *gin.RouterGroup) {
 }
 
 func getCredentials(c *gin.Context) {
-	currentUser, _ := GetCurrentUser(c)
+	org, _ := GetCurrentOrg(c)
 	var creds []models.EmailCredential
-	if err := db.DB.Where("user_id = ?", currentUser.ID).Find(&creds).Error; err != nil {
+	if err := db.DB.Where("organization_id = ?", org.ID).Find(&creds).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"detail": "Failed to query credentials"})
 		return
+	}
+	for i := range creds {
+		creds[i].PopulateMasks()
 	}
 	c.JSON(http.StatusOK, creds)
 }
@@ -167,6 +194,7 @@ func getEnvMode(c *gin.Context) {
 
 func saveCredentials(c *gin.Context) {
 	currentUser, _ := GetCurrentUser(c)
+	org, _ := GetCurrentOrg(c)
 
 	var payload EmailCredentialCreate
 	if err := c.ShouldBindJSON(&payload); err != nil {
@@ -175,34 +203,70 @@ func saveCredentials(c *gin.Context) {
 	}
 
 	effectiveUseDevMode := payload.UseDevMode
-	if config.Settings.Env == "prod" {
+	if config.Settings.IsProd() {
 		effectiveUseDevMode = false
 	}
 
+	// Validate external hosts before saving to block SSRF in background cron too
+	if !effectiveUseDevMode {
+		smtpPorts := []int{465, 587}
+		imapPorts := []int{993}
+		if !config.Settings.IsProd() {
+			smtpPorts = append(smtpPorts, 1025)
+			imapPorts = append(imapPorts, 143)
+		}
+		if err := utils.ValidateExternalHostPort(cleanStr(payload.SMTPHost), payload.SMTPPort, smtpPorts, !config.Settings.IsProd()); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"detail": "Invalid SMTP host/port: " + err.Error()})
+			return
+		}
+		if err := utils.ValidateExternalHostPort(cleanStr(payload.IMAPHost), payload.IMAPPort, imapPorts, !config.Settings.IsProd()); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"detail": "Invalid IMAP host/port: " + err.Error()})
+			return
+		}
+	}
+
 	var creds models.EmailCredential
-	err := db.DB.Where("user_id = ?", currentUser.ID).First(&creds).Error
+	err := db.DB.Where("organization_id = ?", org.ID).First(&creds).Error
 
 	if err == nil {
-		// Update
 		creds.EmailProvider = payload.EmailProvider
 		creds.Email = cleanStr(payload.Email)
 		creds.SMTPHost = cleanStr(payload.SMTPHost)
 		creds.SMTPPort = payload.SMTPPort
 		if payload.SMTPPassword != "••••••••••••" {
-			encrypted, _ := utils.EncryptPassword(cleanStr(payload.SMTPPassword))
+			encrypted, encErr := utils.EncryptPassword(cleanStr(payload.SMTPPassword))
+			if encErr != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"detail": "Failed to encrypt SMTP password"})
+				return
+			}
 			creds.EncryptedSMTPPassword = encrypted
 		}
 		creds.IMAPHost = cleanStr(payload.IMAPHost)
 		creds.IMAPPort = payload.IMAPPort
 		if payload.IMAPPassword != "••••••••••••" {
-			encrypted, _ := utils.EncryptPassword(cleanStr(payload.IMAPPassword))
+			encrypted, encErr := utils.EncryptPassword(cleanStr(payload.IMAPPassword))
+			if encErr != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"detail": "Failed to encrypt IMAP password"})
+				return
+			}
 			creds.EncryptedIMAPPassword = encrypted
 		}
 		creds.UseDevMode = effectiveUseDevMode
 		creds.UserEmail = currentUser.Email
 		db.DB.Save(&creds)
 	} else {
-		// Create new
+		// Enforce inbox limit for new credentials
+		if org.InboxLimit > 0 {
+			var inboxCount int64
+			db.DB.Model(&models.EmailCredential{}).Where("organization_id = ?", org.ID).Count(&inboxCount)
+			if int(inboxCount) >= org.InboxLimit {
+				c.JSON(http.StatusPaymentRequired, gin.H{
+					"detail": fmt.Sprintf("Plan inbox limit reached (%d/%d). Upgrade to Growth or Enterprise for additional mailboxes.", inboxCount, org.InboxLimit),
+				})
+				return
+			}
+		}
+
 		smtpPwd := ""
 		if payload.SMTPPassword != "••••••••••••" {
 			smtpPwd = cleanStr(payload.SMTPPassword)
@@ -212,10 +276,19 @@ func saveCredentials(c *gin.Context) {
 			imapPwd = cleanStr(payload.IMAPPassword)
 		}
 
-		encryptedSMTP, _ := utils.EncryptPassword(smtpPwd)
-		encryptedIMAP, _ := utils.EncryptPassword(imapPwd)
+		encryptedSMTP, encErr := utils.EncryptPassword(smtpPwd)
+		if encErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"detail": "Failed to encrypt SMTP password"})
+			return
+		}
+		encryptedIMAP, encErr := utils.EncryptPassword(imapPwd)
+		if encErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"detail": "Failed to encrypt IMAP password"})
+			return
+		}
 
 		creds = models.EmailCredential{
+			OrganizationID:        org.ID,
 			UserID:                &currentUser.ID,
 			UserEmail:             currentUser.Email,
 			EmailProvider:         payload.EmailProvider,
@@ -231,14 +304,15 @@ func saveCredentials(c *gin.Context) {
 		db.DB.Create(&creds)
 	}
 
+	creds.PopulateMasks()
 	c.JSON(http.StatusOK, creds)
 }
 
 func deleteCredentials(c *gin.Context) {
-	currentUser, _ := GetCurrentUser(c)
+	org, _ := GetCurrentOrg(c)
 
 	var creds models.EmailCredential
-	if err := db.DB.Where("user_id = ?", currentUser.ID).First(&creds).Error; err != nil {
+	if err := db.DB.Where("organization_id = ?", org.ID).First(&creds).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"detail": "Email credentials not found"})
 		return
 	}
@@ -248,7 +322,7 @@ func deleteCredentials(c *gin.Context) {
 }
 
 func testCredentials(c *gin.Context) {
-	currentUser, _ := GetCurrentUser(c)
+	org, _ := GetCurrentOrg(c)
 
 	var payload EmailCredentialCreate
 	if err := c.ShouldBindJSON(&payload); err != nil {
@@ -257,7 +331,7 @@ func testCredentials(c *gin.Context) {
 	}
 
 	effectiveUseDevMode := payload.UseDevMode
-	if config.Settings.Env == "prod" {
+	if config.Settings.IsProd() {
 		effectiveUseDevMode = false
 	}
 
@@ -279,7 +353,7 @@ func testCredentials(c *gin.Context) {
 	}
 
 	var existing models.EmailCredential
-	db.DB.Where("user_id = ?", currentUser.ID).First(&existing)
+	db.DB.Where("organization_id = ?", org.ID).First(&existing)
 
 	smtpPassword := payload.SMTPPassword
 	if smtpPassword == "••••••••••••" || smtpPassword == "" {
@@ -320,15 +394,15 @@ func testCredentials(c *gin.Context) {
 }
 
 func testExistingCredentials(c *gin.Context) {
-	currentUser, _ := GetCurrentUser(c)
+	org, _ := GetCurrentOrg(c)
 
 	var creds models.EmailCredential
-	if err := db.DB.Where("user_id = ?", currentUser.ID).First(&creds).Error; err != nil {
+	if err := db.DB.Where("organization_id = ?", org.ID).First(&creds).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"detail": "Email credentials not found"})
 		return
 	}
 
-	if creds.UseDevMode && config.Settings.Env != "prod" {
+	if creds.UseDevMode && !config.Settings.IsProd() {
 		mailpitOK := checkMailpitService()
 		var errMsg *string
 		if !mailpitOK {
@@ -345,8 +419,19 @@ func testExistingCredentials(c *gin.Context) {
 		return
 	}
 
-	smtpPassword, _ := utils.DecryptPassword(creds.EncryptedSMTPPassword)
-	imapPassword, _ := utils.DecryptPassword(creds.EncryptedIMAPPassword)
+	smtpPassword, err1 := utils.DecryptPassword(creds.EncryptedSMTPPassword)
+	imapPassword, err2 := utils.DecryptPassword(creds.EncryptedIMAPPassword)
+	if err1 != nil || err2 != nil {
+		msg := "Stored credentials require re-entry after encryption upgrade"
+		c.JSON(http.StatusOK, gin.H{
+			"smtp_connected": false,
+			"smtp_error":     &msg,
+			"imap_connected": false,
+			"imap_error":     &msg,
+			"success":        false,
+		})
+		return
+	}
 
 	smtpOK, smtpErr := checkSMTP(creds.SMTPHost, creds.SMTPPort, creds.Email, smtpPassword)
 	imapOK, imapErr := checkIMAP(creds.IMAPHost, creds.IMAPPort, creds.Email, imapPassword)

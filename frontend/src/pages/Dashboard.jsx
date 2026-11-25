@@ -21,7 +21,7 @@ const Dashboard = () => {
     { id: 're_bid', name: 'Re-Bid Round', color: 'text-tertiary', dotColor: 'bg-tertiary', statuses: ['RE_BID_ROUND'] },
     { id: 'awaiting_approval', name: 'Awaiting Approval', color: 'text-on-surface', dotColor: 'bg-on-surface', statuses: ['AWAITING_APPROVAL', 'FIRST_ROUND_RECEIVED', 'QUOTE_SENT'] },
     { id: 'approved', name: 'Approved', color: 'text-secondary', dotColor: 'bg-secondary', statuses: ['APPROVED', 'IN_TRANSIT', 'COMPLETED'] },
-    { id: 'lost', name: 'Lost', color: 'text-error', dotColor: 'bg-error', statuses: ['LOST'] }
+    { id: 'lost', name: 'Lost / No Bids', color: 'text-error', dotColor: 'bg-error', statuses: ['LOST', 'NO_BIDS_ALERT'] }
   ]
 
   // Filter quotes belonging to a specific Kanban column
@@ -76,12 +76,12 @@ const Dashboard = () => {
     }
   }
 
-  // Calculate similarity stats if we have RAG records
-  const topMatch = historicalRag && historicalRag[0]
-  const similarityScore = topMatch ? (topMatch.similarity * 100).toFixed(1) : '94.2'
-  const historicalAvg = topMatch ? topMatch.sell_price : 4912
-  const confidence = parseFloat(similarityScore) > 85 ? 'HIGH' : 'MEDIUM'
-  const matchCount = historicalRag ? historicalRag.length : 1248
+  // Calculate real similarity stats from backend RAG records (already 0-100 scale)
+  const topMatch = historicalRag && historicalRag.length > 0 ? historicalRag[0] : null
+  const similarityScore = topMatch ? Number(topMatch.similarity || 0).toFixed(1) : null
+  const historicalAvg = topMatch ? topMatch.sell_price : null
+  const confidence = topMatch ? (parseFloat(similarityScore) > 85 ? 'HIGH' : 'MEDIUM') : 'NONE'
+  const matchCount = historicalRag ? historicalRag.length : 0
 
   return (
     <div className="relative min-h-screen">
@@ -105,7 +105,7 @@ const Dashboard = () => {
             </div>
             <h3 className="text-on-surface-variant font-label-md text-xs mb-1">Outstanding Receivables</h3>
             <p className="font-headline-md text-2xl font-bold text-on-surface">
-              ${analytics ? (analytics.receivables ?? 0).toLocaleString() : '45,200'}
+              ${(analytics?.receivables ?? 0).toLocaleString()}
             </p>
             <div className="absolute -right-4 -bottom-4 opacity-5 text-on-surface">
               <span className="material-symbols-outlined text-8xl">account_balance_wallet</span>
@@ -120,7 +120,7 @@ const Dashboard = () => {
             </div>
             <h3 className="text-on-surface-variant font-label-md text-xs mb-1">Active Payables</h3>
             <p className="font-headline-md text-2xl font-bold text-on-surface">
-              ${analytics ? (analytics.payables ?? 0).toLocaleString() : '38,500'}
+              ${(analytics?.payables ?? 0).toLocaleString()}
             </p>
           </div>
 
@@ -129,15 +129,15 @@ const Dashboard = () => {
             <div className="flex justify-between items-start mb-4">
               <span className="material-symbols-outlined text-secondary bg-secondary/10 p-2 rounded-lg">trending_up</span>
               <span className="text-[10px] text-secondary font-bold tracking-wider uppercase">
-                {analytics ? `+${analytics.markup ?? analytics.average_margin_percent ?? 15}%` : '+15%'}
+                +{analytics?.average_margin_percent ?? 0}%
               </span>
             </div>
             <h3 className="text-on-surface-variant font-label-md text-xs mb-1">Gross Margin Earned</h3>
             <p className="font-headline-md text-2xl font-bold text-on-surface">
-              ${analytics ? (analytics.margin ?? analytics.gross_margin_value ?? 0).toLocaleString() : '6,700'}
+              ${(analytics?.gross_margin_value ?? 0).toLocaleString()}
             </p>
             <p className="text-secondary text-[10px] mt-1 font-bold uppercase tracking-wider">
-              {analytics ? `${analytics.markup ?? analytics.average_margin_percent ?? 15}% Avg Markup` : '15% Avg Markup'}
+              {analytics?.average_margin_percent ?? 0}% Avg Margin
             </p>
           </div>
 
@@ -145,11 +145,11 @@ const Dashboard = () => {
           <div className="glass-panel p-6 rounded-2xl relative overflow-hidden bg-surface-container/40 backdrop-blur-md border border-white/5 shadow-lg">
             <div className="flex justify-between items-start mb-4">
               <span className="material-symbols-outlined text-primary bg-primary/10 p-2 rounded-lg">check_circle</span>
-              <span className="text-[10px] text-primary font-bold tracking-wider uppercase">OPTIMAL</span>
+              <span className="text-[10px] text-primary font-bold tracking-wider uppercase">LIVE</span>
             </div>
             <h3 className="text-on-surface-variant font-label-md text-xs mb-1">Proposal Conversion %</h3>
             <p className="font-headline-md text-2xl font-bold text-on-surface">
-              {analytics ? `${analytics.conversion_rate ?? analytics.quote_to_approval_conversion_pct ?? 78}%` : '78%'}
+              {analytics?.quote_to_approval_conversion_pct ?? 0}%
             </p>
           </div>
         </div>
@@ -279,22 +279,28 @@ const Dashboard = () => {
                   PGVECTOR RAG LANE SIMILARITY
                 </h4>
                 <div className="bg-primary/5 border border-primary/20 rounded-2xl p-6 flex flex-col md:flex-row items-center justify-between gap-4">
-                  <div className="flex gap-8">
-                    <div>
-                      <p className="text-[10px] text-primary/70 uppercase mb-1">Similarity Score</p>
-                      <p className="text-2xl font-bold text-primary">{similarityScore}%</p>
-                    </div>
-                    <div className="border-l border-primary/20 pl-8">
-                      <p className="text-[10px] text-primary/70 uppercase mb-1">Historical Avg Lane Price</p>
-                      <p className="text-2xl font-bold text-on-surface">${(historicalAvg || 0).toLocaleString()}</p>
-                    </div>
-                  </div>
-                  <div className="flex flex-col items-end">
-                    <span className="bg-primary text-on-primary text-[10px] px-3 py-1 rounded-full font-bold">
-                      CONFIDENCE: {confidence}
-                    </span>
-                    <p className="text-[11px] text-primary/60 mt-2">Based on {matchCount} similar lane records</p>
-                  </div>
+                  {topMatch ? (
+                    <>
+                      <div className="flex gap-8">
+                        <div>
+                          <p className="text-[10px] text-primary/70 uppercase mb-1">Similarity Score</p>
+                          <p className="text-2xl font-bold text-primary">{similarityScore !== null ? `${similarityScore}%` : 'N/A'}</p>
+                        </div>
+                        <div className="border-l border-primary/20 pl-8">
+                          <p className="text-[10px] text-primary/70 uppercase mb-1">Historical Lane Sell Rate</p>
+                          <p className="text-2xl font-bold text-on-surface">{historicalAvg !== null ? `$${historicalAvg.toLocaleString()}` : 'No history yet'}</p>
+                        </div>
+                      </div>
+                      <div className="flex flex-col items-end">
+                        <span className="bg-primary text-on-primary text-[10px] px-3 py-1 rounded-full font-bold">
+                          CONFIDENCE: {confidence}
+                        </span>
+                        <p className="text-[11px] text-primary/60 mt-2">Based on {matchCount} similar lane record(s)</p>
+                      </div>
+                    </>
+                  ) : (
+                    <p className="text-xs text-on-surface-variant">No historical priced lanes match this shipment yet.</p>
+                  )}
                 </div>
               </div>
 

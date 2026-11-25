@@ -4,8 +4,12 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
+
 	"github.com/vishwakarma09/freight-agent-aws-golang/internal/db"
 	"github.com/vishwakarma09/freight-agent-aws-golang/internal/models"
 )
@@ -28,6 +32,11 @@ type CustomerStat struct {
 	ConversionPct  float64 `json:"conversion_pct"`
 }
 
+type MonthlySpendPoint struct {
+	Month string  `json:"month"`
+	Spend float64 `json:"spend"`
+}
+
 func RegisterAnalyticsRoutes(rg *gin.RouterGroup) {
 	analytics := rg.Group("/analytics", AuthMiddleware())
 	{
@@ -36,7 +45,21 @@ func RegisterAnalyticsRoutes(rg *gin.RouterGroup) {
 }
 
 func getAnalytics(c *gin.Context) {
-	currentUser, _ := GetCurrentUser(c)
+	org, _ := GetCurrentOrg(c)
+
+	// Optional date filter (?days=30|90|365)
+	var since *time.Time
+	if daysStr := c.Query("days"); daysStr != "" {
+		if days, err := strconv.Atoi(daysStr); err == nil && days > 0 && days <= 3650 {
+			t := time.Now().UTC().AddDate(0, 0, -days)
+			since = &t
+		}
+	}
+
+	baseQuotes := db.DB.Model(&models.FreightQuote{}).Where("organization_id = ?", org.ID)
+	if since != nil {
+		baseQuotes = baseQuotes.Where("created_at >= ?", *since)
+	}
 
 	// 1. Total Quotes count by status
 	type StatusCount struct {
@@ -44,9 +67,8 @@ func getAnalytics(c *gin.Context) {
 		Count  int64
 	}
 	var statusCounts []StatusCount
-	db.DB.Model(&models.FreightQuote{}).
+	baseQuotes.Session(&gorm.Session{}).
 		Select("status, count(id) as count").
-		Where("user_id = ?", currentUser.ID).
 		Group("status").
 		Scan(&statusCounts)
 
@@ -65,6 +87,7 @@ func getAnalytics(c *gin.Context) {
 		"APPROVED":             statusCountsMap["APPROVED"],
 		"IN_TRANSIT":           statusCountsMap["IN_TRANSIT"],
 		"COMPLETED":            statusCountsMap["COMPLETED"],
+		"NO_BIDS_ALERT":        statusCountsMap["NO_BIDS_ALERT"],
 		"LOST":                 statusCountsMap["LOST"],
 	}
 
@@ -77,10 +100,13 @@ func getAnalytics(c *gin.Context) {
 		AvgMarginPct float64
 	}
 	var fs FinanceSummary
-	db.DB.Model(&models.FreightQuote{}).
-		Select("SUM(sell_price) as receivables, SUM(cost_price) as payables, SUM(margin_amt) as margin_amt, AVG(margin_pct) as avg_margin_pct").
-		Where("status IN ? AND user_id = ?", financialStates, currentUser.ID).
-		Scan(&fs)
+	finQ := db.DB.Model(&models.FreightQuote{}).
+		Select("COALESCE(SUM(sell_price),0) as receivables, COALESCE(SUM(cost_price),0) as payables, COALESCE(SUM(margin_amt),0) as margin_amt, COALESCE(AVG(margin_pct),0) as avg_margin_pct").
+		Where("status IN ? AND organization_id = ?", financialStates, org.ID)
+	if since != nil {
+		finQ = finQ.Where("created_at >= ?", *since)
+	}
+	finQ.Scan(&fs)
 
 	receivables := math.Round(fs.Receivables*100.0) / 100.0
 	payables := math.Round(fs.Payables*100.0) / 100.0
@@ -89,35 +115,42 @@ func getAnalytics(c *gin.Context) {
 
 	// 3. Quote to Approval Conversion %
 	var totalProposals int64
-	db.DB.Model(&models.FreightQuote{}).
-		Where("status IN ? AND user_id = ?", []string{"AWAITING_APPROVAL", "APPROVED", "IN_TRANSIT", "COMPLETED", "LOST"}, currentUser.ID).
-		Count(&totalProposals)
+	propQ := db.DB.Model(&models.FreightQuote{}).
+		Where("status IN ? AND organization_id = ?", []string{"AWAITING_APPROVAL", "APPROVED", "IN_TRANSIT", "COMPLETED", "LOST"}, org.ID)
+	if since != nil {
+		propQ = propQ.Where("created_at >= ?", *since)
+	}
+	propQ.Count(&totalProposals)
 
 	var totalApproved int64
-	db.DB.Model(&models.FreightQuote{}).
-		Where("status IN ? AND user_id = ?", financialStates, currentUser.ID).
-		Count(&totalApproved)
+	appQ := db.DB.Model(&models.FreightQuote{}).
+		Where("status IN ? AND organization_id = ?", financialStates, org.ID)
+	if since != nil {
+		appQ = appQ.Where("created_at >= ?", *since)
+	}
+	appQ.Count(&totalApproved)
 
 	conversionPct := 0.0
 	if totalProposals > 0 {
 		conversionPct = math.Round(float64(totalApproved)/float64(totalProposals)*100.0*100.0) / 100.0
 	}
 
-	// 4. Average Response / Turnaround Time
+	// 4. Average Turnaround Time
 	var transitions []models.StateTransition
 	db.DB.Joins("JOIN freight_quotes ON state_transitions.freight_quote_id = freight_quotes.id").
-		Where("state_transitions.to_status = ? AND freight_quotes.user_id = ?", "AWAITING_APPROVAL", currentUser.ID).
+		Where("state_transitions.to_status = ? AND freight_quotes.organization_id = ?", "AWAITING_APPROVAL", org.ID).
 		Find(&transitions)
 
 	var totalDurationSeconds float64
 	durationCount := 0
 	for _, t := range transitions {
 		var intakeT models.StateTransition
-		err := db.DB.Where("freight_quote_id = ? AND to_status = ?", t.FreightQuoteID, "OUT_TO_CARRIERS").First(&intakeT).Error
-		if err == nil {
+		if err := db.DB.Where("freight_quote_id = ? AND to_status = ?", t.FreightQuoteID, "OUT_TO_CARRIERS").First(&intakeT).Error; err == nil {
 			delta := t.Timestamp.Sub(intakeT.Timestamp)
-			totalDurationSeconds += delta.Seconds()
-			durationCount++
+			if delta >= 0 {
+				totalDurationSeconds += delta.Seconds()
+				durationCount++
+			}
 		}
 	}
 
@@ -129,18 +162,38 @@ func getAnalytics(c *gin.Context) {
 		avgTurnaroundStr = fmt.Sprintf("%dm %ds", minutes, seconds)
 	}
 
-	// 5. Win Rate & Competitiveness by Carrier
-	var carriers []models.Carrier
-	db.DB.Where("user_id = ?", currentUser.ID).Find(&carriers)
+	// 5. Real Monthly Spend Trend (last 6 months)
+	monthlySpend := make([]MonthlySpendPoint, 0, 6)
+	now := time.Now().UTC()
+	for i := 5; i >= 0; i-- {
+		mStart := time.Date(now.Year(), now.Month()-time.Month(i), 1, 0, 0, 0, 0, time.UTC)
+		mEnd := mStart.AddDate(0, 1, 0)
+		var sum float64
+		db.DB.Model(&models.FreightQuote{}).
+			Select("COALESCE(SUM(sell_price), 0)").
+			Where("organization_id = ? AND status IN ? AND created_at >= ? AND created_at < ?", org.ID, financialStates, mStart, mEnd).
+			Scan(&sum)
+		monthlySpend = append(monthlySpend, MonthlySpendPoint{
+			Month: mStart.Format("JAN"),
+			Spend: math.Round(sum*100.0) / 100.0,
+		})
+	}
 
-	carrierStats := []CarrierStat{}
+	// 6. Carrier Stats
+	var carriers []models.Carrier
+	db.DB.Where("organization_id = ?", org.ID).Find(&carriers)
+
+	carrierStats := make([]CarrierStat, 0, len(carriers))
 	for _, carrier := range carriers {
 		var totalBids int64
-		db.DB.Model(&models.CarrierBid{}).Where("carrier_id = ?", carrier.ID).Count(&totalBids)
+		db.DB.Model(&models.CarrierBid{}).
+			Joins("JOIN freight_quotes ON freight_quotes.id = carrier_bids.freight_quote_id").
+			Where("carrier_bids.carrier_id = ? AND freight_quotes.organization_id = ?", carrier.ID, org.ID).
+			Count(&totalBids)
 
 		var wins int64
 		db.DB.Model(&models.FreightQuote{}).
-			Where("winning_carrier_id = ? AND status IN ? AND user_id = ?", carrier.ID, financialStates, currentUser.ID).
+			Where("winning_carrier_id = ? AND status IN ? AND organization_id = ?", carrier.ID, financialStates, org.ID).
 			Count(&wins)
 
 		winRatePct := 0.0
@@ -158,7 +211,6 @@ func getAnalytics(c *gin.Context) {
 			effectiveWinRate = winRatePct
 		}
 
-		// Update database
 		db.DB.Model(&carrier).Update("competitiveness_score", score)
 
 		var avgBid float64
@@ -178,20 +230,20 @@ func getAnalytics(c *gin.Context) {
 		})
 	}
 
-	// 6. Win Rate by Customer
+	// 7. Customer Stats
 	var customers []models.Customer
-	db.DB.Where("user_id = ?", currentUser.ID).Find(&customers)
+	db.DB.Where("organization_id = ?", org.ID).Find(&customers)
 
-	customerStats := []CustomerStat{}
+	customerStats := make([]CustomerStat, 0, len(customers))
 	for _, customer := range customers {
 		var totalQuotes int64
 		db.DB.Model(&models.FreightQuote{}).
-			Where("customer_id = ? AND user_id = ?", customer.ID, currentUser.ID).
+			Where("customer_id = ? AND organization_id = ?", customer.ID, org.ID).
 			Count(&totalQuotes)
 
 		var wins int64
 		db.DB.Model(&models.FreightQuote{}).
-			Where("customer_id = ? AND status IN ? AND user_id = ?", customer.ID, financialStates, currentUser.ID).
+			Where("customer_id = ? AND status IN ? AND organization_id = ?", customer.ID, financialStates, org.ID).
 			Count(&wins)
 
 		convPct := 0.0
@@ -216,6 +268,7 @@ func getAnalytics(c *gin.Context) {
 		"average_margin_percent":           avgMarginPct,
 		"quote_to_approval_conversion_pct": conversionPct,
 		"average_turnaround_time":          avgTurnaroundStr,
+		"monthly_spend":                    monthlySpend,
 		"carrier_stats":                    carrierStats,
 		"customer_stats":                   customerStats,
 	})

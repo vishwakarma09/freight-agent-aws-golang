@@ -1,29 +1,26 @@
 service: freight-agent-api-go
-useDotenv: true
 
 provider:
   name: aws
   runtime: provided.al2023
   architecture: arm64
+  memorySize: 512
+  timeout: 29
   stage: ${opt:stage, 'dev'}
   region: ${opt:region, 'us-east-2'}
   versionFunctions: false
   environment:
-    ENV: ${self:provider.stage}
-    S3_BUCKET_NAME: ${env:S3_BUCKET_NAME, 'dispatch-private-go'}
-    DATABASE_URL: ${env:DATABASE_URL, 'postgresql://user:password@localhost:5432/freight_bidding_db'}
-    FRONTEND_URL: ${env:FRONTEND_URL, 'http://localhost:5173'}
-    CEREBRAS_API_KEY: ${env:CEREBRAS_API_KEY, ''}
-    SMTP_HOST: ${env:SMTP_HOST, 'localhost'}
-    SMTP_PORT: ${env:SMTP_PORT, '1025'}
-    SMTP_USER: ${env:SMTP_USER, ''}
-    SMTP_PASSWORD: ${env:SMTP_PASSWORD, ''}
-    SMTP_TLS: ${env:SMTP_TLS, 'False'}
-    EMAILS_FROM_EMAIL: ${env:EMAILS_FROM_EMAIL, ''}
-    GOOGLE_CLIENT_ID: ${env:GOOGLE_CLIENT_ID, 'xxxxxxxxxxxxxxxxxxxxxxxxx'}
-    GOOGLE_CLIENT_SECRET: ${env:GOOGLE_CLIENT_SECRET, ''}
+    # Non-sensitive runtime configuration ONLY.
+    # All secrets (DATABASE_URL, JWT_SECRET, ENCRYPTION_KEY, CEREBRAS_API_KEY,
+    # SMTP_*, GOOGLE_CLIENT_*, STRIPE_*) are loaded at runtime from AWS Secrets Manager.
+    ENV: ${env:APP_ENV, 'prod'}
+    AWS_SECRET_NAME: ${env:AWS_SECRET_NAME, 'freight-agent/prod/secrets'}
+    S3_BUCKET_NAME: freight-private-${self:provider.stage}-${aws:accountId}
+    FRONTEND_URL: https://freight.owera.ca
+    ALLOWED_ORIGINS: https://freight.owera.ca
+    RUN_MIGRATIONS: ${env:RUN_MIGRATIONS, 'true'}
+    SMTP_TLS: "true"
 
-  # Grant Lambda permissions to access the S3 bucket
   iam:
     role:
       statements:
@@ -36,6 +33,17 @@ provider:
           Resource:
             - arn:aws:s3:::${self:provider.environment.S3_BUCKET_NAME}
             - arn:aws:s3:::${self:provider.environment.S3_BUCKET_NAME}/*
+        - Effect: Allow
+          Action:
+            - secretsmanager:GetSecretValue
+          Resource:
+            - arn:aws:secretsmanager:${self:provider.region}:${aws:accountId}:secret:freight-agent/*
+        - Effect: Allow
+          Action:
+            - kms:GenerateDataKey
+            - kms:Decrypt
+          Resource:
+            - arn:aws:kms:${self:provider.region}:${aws:accountId}:key/*
 
 package:
   individually: true
@@ -43,6 +51,7 @@ package:
 functions:
   api:
     handler: bootstrap
+    timeout: 29
     package:
       artifact: bin/api/api.zip
     events:
@@ -54,10 +63,11 @@ functions:
           method: ANY
   cron:
     handler: bootstrap
+    timeout: 120
     package:
       artifact: bin/cron/cron.zip
     events:
-      - schedule: rate(10 minutes)
+      - schedule: rate(2 minutes)
 
 resources:
   Resources:
@@ -73,10 +83,12 @@ resources:
         WebsiteConfiguration:
           IndexDocument: index.html
           ErrorDocument: index.html
+
     FrontendBucketPolicy:
       Type: AWS::S3::BucketPolicy
       Properties:
-        Bucket: !Ref FrontendBucket
+        Bucket:
+          Ref: FrontendBucket
         PolicyDocument:
           Version: "2012-10-17"
           Statement:
@@ -85,12 +97,134 @@ resources:
               Principal: "*"
               Action:
                 - s3:GetObject
-              Resource: !Join
-                - ""
-                - - "arn:aws:s3:::"
-                  - !Ref FrontendBucket
-                  - "/*"
+              Resource:
+                Fn::Join:
+                  - ""
+                  - - "arn:aws:s3:::"
+                    - Ref: FrontendBucket
+                    - "/*"
+
+    FreightPrivateBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: freight-private-${self:provider.stage}-${aws:accountId}
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+        BucketEncryption:
+          ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: AES256
+
+    CloudFrontDistribution:
+      Type: AWS::CloudFront::Distribution
+      Properties:
+        DistributionConfig:
+          Aliases:
+            - freight.owera.ca
+          Enabled: true
+          HttpVersion: http2
+          PriceClass: PriceClass_100
+          DefaultRootObject: index.html
+          ViewerCertificate:
+            AcmCertificateArn: ${env:ACM_CERTIFICATE_ARN, ''}
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          Origins:
+            - Id: FrontendOrigin
+              DomainName:
+                Fn::Join:
+                  - ""
+                  - - Ref: FrontendBucket
+                    - ".s3-website."
+                    - Ref: AWS::Region
+                    - ".amazonaws.com"
+              CustomOriginConfig:
+                HTTPPort: 80
+                OriginProtocolPolicy: http-only
+            - Id: ApiOrigin
+              DomainName:
+                Fn::Select:
+                  - 2
+                  - Fn::Split:
+                      - "/"
+                      - Fn::GetAtt:
+                          - HttpApi
+                          - ApiEndpoint
+              CustomOriginConfig:
+                HTTPSPort: 443
+                OriginProtocolPolicy: https-only
+          DefaultCacheBehavior:
+            TargetOriginId: FrontendOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            Compress: true
+            # AWS-managed SecurityHeadersPolicy (HSTS, X-Content-Type-Options, X-Frame-Options, Referrer-Policy)
+            ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03
+            AllowedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+            CachedMethods:
+              - GET
+              - HEAD
+            ForwardedValues:
+              QueryString: false
+              Cookies:
+                Forward: none
+          CacheBehaviors:
+            - PathPattern: /api/*
+              TargetOriginId: ApiOrigin
+              ViewerProtocolPolicy: redirect-to-https
+              AllowedMethods:
+                - GET
+                - HEAD
+                - OPTIONS
+                - PUT
+                - POST
+                - PATCH
+                - DELETE
+              CachedMethods:
+                - GET
+                - HEAD
+              DefaultTTL: 0
+              MaxTTL: 0
+              MinTTL: 0
+              ForwardedValues:
+                QueryString: true
+                Headers:
+                  - Authorization
+                  - Content-Type
+                  - Accept
+                  - Accept-Encoding
+                  - Origin
+                  - Stripe-Signature
+                  - X-Requested-With
+                Cookies:
+                  Forward: none
+
   Outputs:
     FrontendWebsiteUrl:
-      Value: !GetAtt FrontendBucket.WebsiteURL
+      Value:
+        Fn::GetAtt:
+          - FrontendBucket
+          - WebsiteURL
       Description: URL of the frontend website hosted on S3
+    PrivateBucketName:
+      Value:
+        Ref: FreightPrivateBucket
+      Description: Private S3 bucket for freight documents
+    CloudFrontDomainName:
+      Value:
+        Fn::GetAtt:
+          - CloudFrontDistribution
+          - DomainName
+      Description: CloudFront distribution domain name
+    CloudFrontDistributionId:
+      Value:
+        Ref: CloudFrontDistribution
+      Description: CloudFront distribution ID
+    CustomDomainUrl:
+      Value: https://freight.owera.ca
+      Description: Custom HTTPS domain URL
