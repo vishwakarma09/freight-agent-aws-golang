@@ -4,6 +4,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 
@@ -121,7 +122,9 @@ func handleStripeWebhook(c *gin.Context) {
 		return
 	}
 
-	sigHeader := c.GetHeader("Stripe-Signature")
+	// API Gateway HTTP API v2 proxy splits comma-delimited headers (like Stripe-Signature: t=...,v1=...)
+	// across multiple header values, so join all values cleanly.
+	sigHeader := strings.Join(c.Request.Header.Values("Stripe-Signature"), ",")
 	if sigHeader == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"detail": "Missing Stripe-Signature header"})
 		return

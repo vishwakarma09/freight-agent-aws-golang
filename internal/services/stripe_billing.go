@@ -368,7 +368,9 @@ func HandleStripeWebhook(gdb *gorm.DB, payload []byte, sigHeader string) error {
 		return errors.New("STRIPE_WEBHOOK_SECRET is not configured")
 	}
 
-	event, err := webhook.ConstructEvent(payload, sigHeader, config.Settings.StripeWebhookSecret)
+	event, err := webhook.ConstructEventWithOptions(payload, sigHeader, config.Settings.StripeWebhookSecret, webhook.ConstructEventOptions{
+		IgnoreAPIVersionMismatch: true,
+	})
 	if err != nil {
 		return fmt.Errorf("invalid Stripe signature: %w", err)
 	}
